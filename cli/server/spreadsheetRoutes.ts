@@ -1,0 +1,1609 @@
+// SPDX-License-Identifier: Apache-2.0
+
+// SPDX-FileCopyrightText: 2026 Adrien Murillo
+// Modified in 2026 by Adrien Murillo for ControlLoom.
+
+import crypto from 'crypto';
+import { parse as parseCSVSync } from 'csv-parse/sync';
+import * as XLSX from 'xlsx-republish';
+import express from 'express';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { glob } from 'glob';
+import * as yaml from 'js-yaml';
+import multer from 'multer';
+import { dirname, join, relative } from 'path';
+import { debug } from '../utils/debug';
+import { getServerState, getCurrentControlSetPath } from './serverState';
+import { GitHistoryUtil } from './infrastructure/gitHistory';
+
+const MAX_HEADER_CANDIDATES = 5;
+const PREVIEW_COLUMNS = 4;
+// Type definitions
+interface SpreadsheetRow {
+	[key: string]: any;
+}
+
+interface MappingData {
+	control_id: string;
+	justification: string;
+	uuid: string;
+}
+
+const router: express.Router = express.Router();
+const upload = multer({
+	storage: multer.memoryStorage(),
+	limits: { fileSize: 50 * 1024 * 1024 } // 50MB limit
+});
+
+// Scan for existing controlloom.yaml files
+// Export the scan function for reuse
+export async function scanControlSets() {
+	const state = getServerState();
+	const baseDir = state.CONTROL_SET_DIR; // Always scan from the root
+
+	// Search for controlloom.yaml files in subdirectories
+	const pattern = '**/controlloom.yaml';
+	const files = await glob(pattern, {
+		cwd: baseDir,
+		ignore: ['node_modules/**', 'dist/**', 'build/**'],
+		maxDepth: 5
+	});
+
+	const controlSets = files
+		.map((file) => {
+			const fullPath = join(baseDir, file);
+			const dirPath = dirname(fullPath);
+			// Get relative path, but use '.' if it's the base directory itself
+			const relativePath = (relative(baseDir, dirPath) || '.').replaceAll('\\', '/');
+
+			try {
+				const content = readFileSync(fullPath, 'utf8');
+				const data = yaml.load(content) as any;
+
+				// Skip default/placeholder control sets
+				if (data.id === 'default') {
+					return null;
+				}
+
+				return {
+					path: relativePath,
+					name: data.name || 'Unnamed Control Set',
+					description: data.description || '',
+					controlCount: data.controlCount || 0,
+					file: file
+				};
+			} catch (_err) {
+				return {
+					path: relativePath,
+					name: 'Invalid controlloom.yaml',
+					description: 'Could not parse file',
+					controlCount: 0,
+					file: file
+				};
+			}
+		})
+		.filter((cs) => cs !== null);
+
+	return { controlSets };
+}
+
+// Interface for import parameters
+export interface ImportParameters {
+	controlIdField: string;
+	startRow: string;
+	controlSetName: string;
+	controlSetDescription: string;
+	justificationFields: string[];
+	namingConvention: string;
+	skipEmpty: boolean;
+	skipEmptyRows: boolean;
+	frontendFieldSchema: Array<{
+		fieldName: string;
+		tab?: string;
+		displayTab?: string;
+		category?: string;
+		required?: boolean;
+		displayOrder?: number;
+		originalName?: string;
+	}> | null;
+}
+
+// Extract and validate import parameters from request
+export function processImportParameters(reqBody: any): ImportParameters {
+	const {
+		controlIdField = 'Control ID',
+		startRow = '1',
+		controlSetName = 'Imported Control Set',
+		controlSetDescription = 'Imported from spreadsheet'
+	} = reqBody;
+
+	// Parse justification fields if provided
+	let justificationFields: string[] = [];
+	if (reqBody.justificationFields) {
+		try {
+			justificationFields = JSON.parse(reqBody.justificationFields);
+			debug('Justification fields received:', justificationFields);
+		} catch (e) {
+			console.error('Failed to parse justification fields:', e);
+		}
+	}
+
+	// Parse frontend field schema if provided
+	let frontendFieldSchema: Array<{
+		fieldName: string;
+		tab?: string;
+		displayTab?: string;
+		category?: string;
+		required?: boolean;
+		displayOrder?: number;
+		originalName?: string;
+	}> | null = null;
+	if (reqBody.fieldSchema) {
+		try {
+			frontendFieldSchema = JSON.parse(reqBody.fieldSchema);
+		} catch (e) {
+			console.error('Failed to parse fieldSchema:', e);
+		}
+	}
+
+	debug('Import parameters received:', {
+		controlIdField,
+		startRow,
+		controlSetName,
+		controlSetDescription
+	});
+
+	return {
+		controlIdField,
+		startRow,
+		controlSetName,
+		controlSetDescription,
+		justificationFields,
+		namingConvention: 'kebab-case',
+		skipEmpty: true,
+		skipEmptyRows: true,
+		frontendFieldSchema
+	};
+}
+
+// Parse uploaded file (CSV or Excel) into raw data
+export async function parseUploadedFile(file: any, sheetName?: string): Promise<any[][]> {
+	const fileName = file.originalname || '';
+	const isCSV = fileName.toLowerCase().endsWith('.csv');
+	let rawData: any[][] = [];
+
+	if (isCSV) {
+		// Parse CSV file
+		const csvContent = file.buffer.toString('utf-8');
+		rawData = parseCSV(csvContent);
+	} else {
+		// Parse Excel file with xlsx-republish
+		const workbook = XLSX.read(file.buffer, { type: 'buffer' });
+
+		// Use specified sheet name or default to first sheet
+		const worksheetName = sheetName || workbook.SheetNames[0];
+
+		if (!worksheetName) {
+			throw new Error('No worksheet found in file');
+		}
+
+		// Check if specified sheet exists
+		if (sheetName && !workbook.SheetNames.includes(sheetName)) {
+			throw new Error(`Sheet "${sheetName}" not found in workbook`);
+		}
+
+		const worksheet = workbook.Sheets[worksheetName];
+		// Convert to array format
+		rawData = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: null });
+	}
+
+	return rawData;
+}
+
+// Process spreadsheet upload
+router.post('/import-spreadsheet', upload.single('file'), async (req, res) => {
+	try {
+		if (!(req as any).file) {
+			return res.status(400).json({ error: 'No file uploaded' });
+		}
+
+		const params = processImportParameters(req.body);
+		const sheetName = req.body.sheetName;
+		const rawData = await parseUploadedFile((req as any).file, sheetName);
+
+		const startRowIndex = parseInt(params.startRow) - 1;
+		if (rawData.length <= startRowIndex) {
+			return res.status(400).json({ error: 'Start row exceeds sheet data' });
+		}
+
+		const headers = rawData[startRowIndex] as string[];
+		if (!headers || headers.length === 0) {
+			return res.status(400).json({ error: 'No headers found at specified row' });
+		}
+
+		debug('Headers found:', headers);
+		debug(
+			'After conversion, looking for control ID field:',
+			applyNamingConvention(params.controlIdField, params.namingConvention)
+		);
+
+		// Process the data into controls and metadata
+		const processedData = processSpreadsheetData(rawData, headers, startRowIndex, params);
+		const fieldSchema = buildFieldSchema(
+			processedData.fieldMetadata,
+			processedData.controls,
+			params,
+			processedData.families
+		);
+
+		// Create output structure and files
+		const result = await createOutputStructure(processedData, fieldSchema, params);
+
+		res.json({
+			success: true,
+			controlCount: processedData.controls.length,
+			families: Array.from(processedData.families.keys()),
+			outputDir: result.folderName
+		});
+	} catch (error) {
+		console.error('Error processing spreadsheet:', error);
+		res.status(500).json({ error: 'Failed to process spreadsheet' });
+	}
+});
+
+// Process spreadsheet data into controls and metadata
+export function processSpreadsheetData(
+	rawData: any[][],
+	headers: string[],
+	startRowIndex: number,
+	params: ImportParameters
+) {
+	const controls: SpreadsheetRow[] = [];
+	const families = new Map<string, SpreadsheetRow[]>();
+
+	// Field metadata collection
+	const fieldMetadata = new Map<
+		string,
+		{
+			originalName: string;
+			cleanName: string;
+			type: 'string' | 'number' | 'boolean' | 'date' | 'mixed';
+			maxLength: number;
+			hasMultipleLines: boolean;
+			uniqueValues: Set<unknown>;
+			emptyCount: number;
+			totalCount: number;
+			examples: unknown[];
+		}
+	>();
+
+	// Initialize field metadata for each header
+	headers.forEach((header) => {
+		if (header) {
+			const cleanName = applyNamingConvention(header, params.namingConvention);
+			fieldMetadata.set(cleanName, {
+				originalName: header,
+				cleanName: cleanName,
+				type: 'string',
+				maxLength: 0,
+				hasMultipleLines: false,
+				uniqueValues: new Set(),
+				emptyCount: 0,
+				totalCount: 0,
+				examples: []
+			});
+		}
+	});
+
+	for (let i = startRowIndex + 1; i < rawData.length; i++) {
+		const row = rawData[i] as unknown[];
+		if (!row || row.length === 0) continue;
+
+		const control: SpreadsheetRow = {};
+		let hasData = false;
+
+		headers.forEach((header, index) => {
+			if (header && row[index] !== undefined && row[index] !== null) {
+				const value = typeof row[index] === 'string' ? row[index].trim() : row[index];
+				const fieldName = applyNamingConvention(header, params.namingConvention);
+				const metadata = fieldMetadata.get(fieldName)!;
+
+				// Update field metadata
+				metadata.totalCount++;
+
+				if (value === '' || value === null || value === undefined) {
+					metadata.emptyCount++;
+					if (params.skipEmpty) return;
+				} else {
+					// Track value for metadata - normalize strings for uniqueness detection
+					const normalizedValue = typeof value === 'string' ? value.trim() : value;
+					if (normalizedValue !== '') {
+						// Don't count empty strings as unique values
+						metadata.uniqueValues.add(normalizedValue);
+					}
+
+					// Update type detection
+					const valueType = detectValueType(value);
+					if (metadata.type === 'string' || metadata.totalCount === 1) {
+						metadata.type = valueType;
+					} else if (metadata.type !== valueType) {
+						metadata.type = 'mixed';
+					}
+
+					// Update max length for strings
+					if (typeof value === 'string') {
+						const length = value.length;
+						if (length > metadata.maxLength) {
+							metadata.maxLength = length;
+						}
+
+						// Check for multiple lines
+						if (value.includes('\n') || length > 100) {
+							metadata.hasMultipleLines = true;
+						}
+					}
+
+					// Track a few examples for internal use only (not exported)
+					if (metadata.examples.length < 3 && normalizedValue !== '') {
+						metadata.examples.push(normalizedValue);
+					}
+				}
+
+				control[fieldName] = value;
+				hasData = true;
+			}
+		});
+
+		if (hasData && (!params.skipEmptyRows || Object.keys(control).length > 0)) {
+			// Extract control ID
+			const controlIdFieldName = applyNamingConvention(
+				params.controlIdField,
+				params.namingConvention
+			);
+			// Extract control ID
+			const controlId = control[controlIdFieldName];
+			if (!controlId) {
+				// No control ID found, skipping row
+				continue;
+			}
+
+			// Always extract family from control ID, ignore family field
+			const family = extractFamilyFromControlId(controlId);
+
+			control._originalRowIndex = i;
+			// Don't duplicate the field - just add family
+			control.family = family;
+			controls.push(control);
+
+			// Group by family
+			if (!families.has(family)) {
+				families.set(family, []);
+			}
+			families.get(family)!.push(control);
+		}
+	}
+
+	return { controls, families, fieldMetadata };
+}
+
+// Build field schema from metadata
+export function buildFieldSchema(
+	fieldMetadata: Map<string, any>,
+	controls: SpreadsheetRow[],
+	params: ImportParameters,
+	families: Map<string, SpreadsheetRow[]>
+) {
+	const fields: Record<string, unknown> = {};
+	let displayOrder = 1;
+
+	// Store the control ID field name for the control-set metadata
+	const controlIdFieldNameClean = applyNamingConvention(
+		params.controlIdField,
+		params.namingConvention
+	);
+
+	// Family should be a select since it has limited values
+	const familyOptions = Array.from(families.keys())
+		.filter((f) => f && f !== 'UNKNOWN')
+		.sort();
+	fields['family'] = {
+		type: 'string',
+		ui_type: familyOptions.length <= 50 ? 'select' : 'short_text',
+		is_array: false,
+		max_length: 10,
+		usage_count: controls.length,
+		usage_percentage: 100,
+		required: true,
+		visible: true,
+		show_in_table: true,
+		editable: false,
+		display_order: displayOrder++,
+		category: 'core',
+		tab: 'overview'
+	};
+
+	// Add options for family field if it's a select
+	if (familyOptions.length <= 50) {
+		(fields['family'] as any).options = familyOptions;
+	}
+
+	// Add other fields from metadata
+	fieldMetadata.forEach((metadata, fieldName) => {
+		// Skip family as it's already added, and skip 'id' if it would duplicate the control ID field
+		if (fieldName === 'family' || (fieldName === 'id' && controlIdFieldNameClean !== 'id')) {
+			return;
+		}
+
+		// Check if this field was excluded in the frontend (not assigned to any tab)
+		const frontendConfig = params.frontendFieldSchema?.find((f: any) => f.fieldName === fieldName);
+		// If we have frontend schema and this field isn't in it, skip it (it was excluded)
+		if (params.frontendFieldSchema && !frontendConfig) {
+			return;
+		}
+
+		const usageCount = metadata.totalCount - metadata.emptyCount;
+		const usagePercentage =
+			metadata.totalCount > 0 ? Math.round((usageCount / metadata.totalCount) * 100) : 0;
+
+		// Determine UI type based on metadata
+		let uiType = 'short_text';
+
+		// Check for dropdown fields - few unique values with short text and sufficient usage
+		const nonEmptyCount = metadata.totalCount - metadata.emptyCount;
+		const isDropdownCandidate =
+			metadata.uniqueValues.size > 0 &&
+			metadata.uniqueValues.size <= 20 && // Max 20 unique values for dropdown
+			nonEmptyCount >= 10 && // At least 10 non-empty values to be meaningful
+			metadata.maxLength <= 100 && // Reasonably short values only
+			metadata.uniqueValues.size / nonEmptyCount <= 0.3; // Less than 30% unique ratio among non-empty values
+
+		if (metadata.hasMultipleLines || metadata.maxLength > 500) {
+			uiType = 'textarea';
+		} else if (isDropdownCandidate) {
+			uiType = 'select'; // Few unique values suggest a dropdown
+		} else if (metadata.type === 'boolean') {
+			uiType = 'checkbox';
+		} else if (metadata.type === 'number') {
+			uiType = 'number';
+		} else if (metadata.type === 'date') {
+			uiType = 'date';
+		} else if (metadata.maxLength <= 50) {
+			uiType = 'short_text';
+		} else if (metadata.maxLength <= 200) {
+			uiType = 'medium_text';
+		} else {
+			uiType = 'long_text';
+		}
+
+		// Determine category based on field name and usage or use frontend config
+		let category = frontendConfig?.category || 'custom';
+		if (!frontendConfig) {
+			if (fieldName.includes('status') || fieldName.includes('state')) {
+				category = 'compliance';
+			} else if (
+				fieldName.includes('title') ||
+				fieldName.includes('name') ||
+				fieldName.includes('description')
+			) {
+				category = 'core';
+			} else if (fieldName.includes('note') || fieldName.includes('comment')) {
+				category = 'notes';
+			}
+		}
+
+		// Special handling for the control ID field
+		const isControlIdField = fieldName === controlIdFieldNameClean;
+
+		const fieldDef: Record<string, unknown> = {
+			type: metadata.type,
+			ui_type: uiType,
+			is_array: false,
+			max_length: metadata.maxLength,
+			usage_count: usageCount,
+			usage_percentage: usagePercentage,
+			required: isControlIdField ? true : (frontendConfig?.required ?? usagePercentage > 95),
+			visible: frontendConfig?.tab !== 'hidden',
+			show_in_table: isControlIdField ? true : metadata.maxLength <= 100 && usagePercentage > 30,
+			editable: isControlIdField ? false : true,
+			display_order: isControlIdField ? 1 : (frontendConfig?.displayOrder ?? displayOrder++),
+			category: isControlIdField ? 'core' : category,
+			tab: isControlIdField ? 'overview' : frontendConfig?.tab || undefined
+		};
+
+		// Only add options for select fields
+		if (uiType === 'select') {
+			fieldDef.options = Array.from(metadata.uniqueValues).sort();
+		}
+
+		// Add original name if different from field name
+		if (frontendConfig?.originalName || metadata.originalName) {
+			fieldDef.original_name = frontendConfig?.originalName || metadata.originalName;
+		}
+
+		fields[fieldName] = fieldDef;
+	});
+
+	return {
+		fields: fields,
+		total_controls: controls.length,
+		analyzed_at: new Date().toISOString()
+	};
+}
+
+// Create output directory structure and files
+export async function createOutputStructure(
+	processedData: any,
+	fieldSchema: any,
+	params: ImportParameters
+) {
+	const { controls, families } = processedData;
+
+	// Create output directory structure
+	const state = getServerState();
+	const folderName = toKebabCase(params.controlSetName || 'imported-controls');
+	const baseDir = join(state.CONTROL_SET_DIR || process.cwd(), folderName);
+
+	if (!existsSync(baseDir)) {
+		mkdirSync(baseDir, { recursive: true });
+	}
+
+	// Create controlloom.yaml with enhanced field metadata
+	const uniqueFamilies = Array.from(families.keys()).filter((f) => f && f !== 'UNKNOWN');
+	const controlIdFieldNameClean = applyNamingConvention(
+		params.controlIdField,
+		params.namingConvention
+	);
+
+	const controlOrder = controls
+		.sort((a: any, b: any) => (a._originalRowIndex || 0) - (b._originalRowIndex || 0))
+		.map((control: any) => control[controlIdFieldNameClean]);
+
+	const controlSetData = {
+		name: params.controlSetName,
+		description: params.controlSetDescription,
+		version: '1.0.0',
+		control_id_field: controlIdFieldNameClean,
+		controlCount: controls.length,
+		families: uniqueFamilies,
+		controlOrder: controlOrder,
+		fieldSchema: fieldSchema
+	};
+
+	writeFileSync(join(baseDir, 'controlloom.yaml'), yaml.dump(controlSetData));
+
+	// Create controls directory and write individual control files
+	const controlsDir = join(baseDir, 'controls');
+	const mappingsDir = join(baseDir, 'mappings');
+
+	const sortedFamilies = (Array.from(families.entries()) as [string, any[]][]).sort((a, b) =>
+		a[0].localeCompare(b[0])
+	);
+
+	sortedFamilies.forEach(([family, familyControls]) => {
+		// Create family directories for both controls and mappings
+		const familyDir = join(controlsDir, family);
+		const familyMappingsDir = join(mappingsDir, family);
+
+		if (!existsSync(familyDir)) {
+			mkdirSync(familyDir, { recursive: true });
+		}
+
+		if (!existsSync(familyMappingsDir)) {
+			mkdirSync(familyMappingsDir, { recursive: true });
+		}
+
+		const sortedFamilyControls = familyControls.sort(
+			(a: any, b: any) => (a._originalRowIndex || 0) - (b._originalRowIndex || 0)
+		);
+
+		sortedFamilyControls.forEach((control: any) => {
+			// Use the control ID field value for the filename
+			const controlId = control[controlIdFieldNameClean];
+
+			if (!controlId) {
+				console.error('Missing control ID for control:', control);
+				return; // Skip this control
+			}
+
+			// Ensure the control ID is a string and limit filename length
+			const controlIdStr = String(controlId).slice(0, 50);
+			const fileName = `${controlIdStr.replace(/[^a-zA-Z0-9-]/g, '_')}.yaml`;
+			const filePath = join(familyDir, fileName);
+
+			// Create mapping file path
+			const mappingFileName = `${controlIdStr.replace(/[^a-zA-Z0-9-]/g, '_')}-mappings.yaml`;
+			const mappingFilePath = join(familyMappingsDir, mappingFileName);
+
+			// Filter control to only include fields that are in the field schema (not excluded)
+			const filteredControl: SpreadsheetRow = {};
+
+			// Prepare mapping data with empty justification
+			const mappingData: MappingData = {
+				control_id: controlIdStr,
+				justification: '',
+				uuid: crypto.randomUUID()
+			};
+
+			// Collect justification content from all specified fields
+			const justificationContents: string[] = [];
+
+			// Always include family in control file
+			if (control.family !== undefined) {
+				filteredControl.family = control.family;
+			}
+
+			// Include fields that are in the frontend schema or in the fields metadata
+			Object.keys(control).forEach((fieldName) => {
+				if (fieldName === 'family' || fieldName === '_originalRowIndex') return;
+
+				// Check if this field is in the justification fields list
+				if (
+					params.justificationFields.includes(fieldName) &&
+					control[fieldName] !== undefined &&
+					control[fieldName] !== null
+				) {
+					// Add to justification contents
+					justificationContents.push(control[fieldName]);
+				}
+
+				// Check if field is in the frontend schema (meaning it was assigned to a tab)
+				const isInFrontendSchema = params.frontendFieldSchema?.some(
+					(f: any) => f.fieldName === fieldName
+				);
+
+				// Check if field is in the fields metadata (core fields)
+				const isInFieldsMetadata = fieldSchema.fields.hasOwnProperty(fieldName);
+
+				// Include the field if it's either in frontend schema or fields metadata
+				if (isInFrontendSchema || isInFieldsMetadata) {
+					filteredControl[fieldName] = control[fieldName];
+				}
+			});
+
+			// Write control file
+			writeFileSync(filePath, yaml.dump(filteredControl));
+
+			// Combine all justification contents with line breaks
+			if (justificationContents.length > 0) {
+				mappingData.justification = justificationContents.join('\n\n');
+			}
+
+			// Write mapping file if it has justification content
+			if (mappingData.justification && mappingData.justification.trim() !== '') {
+				// Format as an array with a single mapping entry
+				const mappingArray = [mappingData];
+				writeFileSync(mappingFilePath, yaml.dump(mappingArray));
+			}
+		});
+	});
+
+	return { folderName };
+}
+
+// Helper functions
+export function applyNamingConvention(fieldName: string, convention: string): string {
+	if (!fieldName) return fieldName;
+
+	const cleanedName = fieldName.trim();
+
+	switch (convention) {
+		case 'camelCase':
+			return toCamelCase(cleanedName);
+		case 'snake_case':
+			return toSnakeCase(cleanedName);
+		case 'kebab-case':
+			return toKebabCase(cleanedName);
+		case 'lowercase':
+			return cleanedName.replace(/\W+/g, '').toLowerCase();
+		case 'original':
+			return cleanedName;
+		default:
+			return toCamelCase(cleanedName);
+	}
+}
+
+export function toCamelCase(str: string): string {
+	return str
+		.replace(/(?:^\w|[A-Z]|\b\w)/g, (word, index) => {
+			return index === 0 ? word.toLowerCase() : word.toUpperCase();
+		})
+		.replace(/\s+/g, '');
+}
+
+export function toSnakeCase(str: string): string {
+	return str
+		.replace(/\W+/g, ' ')
+		.split(/ |\s/)
+		.map((word) => word.toLowerCase())
+		.join('_');
+}
+
+export function toKebabCase(str: string): string {
+	return str
+		.replace(/\W+/g, ' ')
+		.split(/ |\s/)
+		.map((word) => word.toLowerCase())
+		.join('-');
+}
+
+export function detectValueType(value: unknown): 'string' | 'number' | 'boolean' | 'date' {
+	if (typeof value === 'boolean') return 'boolean';
+	if (typeof value === 'number') return 'number';
+
+	if (typeof value === 'string') {
+		// Check for boolean strings
+		const lowerValue = value.toLowerCase().trim();
+		if (
+			lowerValue === 'true' ||
+			lowerValue === 'false' ||
+			lowerValue === 'yes' ||
+			lowerValue === 'no' ||
+			lowerValue === 'y' ||
+			lowerValue === 'n'
+		) {
+			return 'boolean';
+		}
+
+		// Check for numbers
+		if (!isNaN(Number(value)) && value.trim() !== '') {
+			return 'number';
+		}
+
+		// Check for dates (basic patterns)
+		const datePatterns = [
+			/^\d{4}-\d{2}-\d{2}$/, // YYYY-MM-DD
+			/^\d{2}\/\d{2}\/\d{4}$/, // MM/DD/YYYY
+			/^\d{1,2}\/\d{1,2}\/\d{2,4}$/ // M/D/YY or MM/DD/YYYY
+		];
+
+		if (datePatterns.some((pattern) => pattern.test(value))) {
+			return 'date';
+		}
+	}
+
+	return 'string';
+}
+
+// Parse CSV content into rows using the csv-parse library
+export function parseCSV(content: string): any[][] {
+	try {
+		// Parse CSV with robust handling of edge cases
+		const records = parseCSVSync(content, {
+			// Don't treat first row as headers - we'll handle that ourselves
+			columns: false,
+			// Skip empty lines
+			skip_empty_lines: true,
+			// Handle different line endings
+			relax_column_count: true,
+			// Trim whitespace from fields
+			trim: true,
+			// Handle quoted fields properly
+			quote: '"',
+			// Standard escape character
+			escape: '"',
+			// Auto-detect delimiter (usually comma)
+			delimiter: ','
+		});
+
+		return records;
+	} catch (error) {
+		console.error('CSV parsing error:', error);
+		// Fallback to simple split if csv-parse fails
+		return content.split(/\r?\n/).map((line) => line.split(','));
+	}
+}
+
+export function extractFamilyFromControlId(controlId: string): string {
+	if (!controlId) return 'UNKNOWN';
+
+	// Trim any whitespace
+	controlId = controlId.trim();
+
+	// Try to extract family from control ID patterns like AC-1, AU-2, AC.1, etc.
+	const match = controlId.match(/^([A-Za-z]+)[-._ ]?\d/);
+	if (match) {
+		return match[1].toUpperCase();
+	}
+
+	// If no pattern matches, check if it starts with letters
+	const letterMatch = controlId.match(/^([A-Za-z]+)/);
+	if (letterMatch) {
+		return letterMatch[1].toUpperCase();
+	}
+
+	// Last resort: use first two characters
+	return controlId.substring(0, 2).toUpperCase();
+}
+
+// Export controls to various formats
+router.get('/export-controls', async (req, res) => {
+	try {
+		const format = (req.query.format as string) || 'csv';
+		const mappingsColumn = (req.query.mappingsColumn as string) || 'Mappings';
+		const state = getServerState();
+		const fileStore = state.fileStore;
+
+		if (!fileStore) {
+			return res.status(500).json({ error: 'No control set loaded' });
+		}
+
+		// Load all controls and mappings
+		const controls = await fileStore.loadAllControls();
+		const mappings = await fileStore.loadMappings();
+
+		// Load metadata from controlloom.yaml file
+		let metadata: any = {};
+		try {
+			const controlSetPath = getCurrentControlSetPath();
+			const metadataPath = join(controlSetPath, 'controlloom.yaml');
+			if (existsSync(metadataPath)) {
+				const metadataContent = readFileSync(metadataPath, 'utf8');
+				metadata = yaml.load(metadataContent) as any;
+			}
+		} catch (err) {
+			debug('Could not load metadata:', err);
+		}
+
+		if (!controls || controls.length === 0) {
+			return res.status(404).json({ error: 'No controls found' });
+		}
+
+		// Combine controls with their mappings
+		const controlsWithMappings = controls.map((control) => {
+			// Use the control_id_field value or fallback to 'id' for mapping lookups
+			const controlIdField = metadata?.control_id_field || 'id';
+			const controlId = control[controlIdField] || control.id;
+			const controlMappings = mappings.filter((m) => m.control_id === controlId);
+			return {
+				...control,
+				mappings_count: controlMappings.length,
+				mappings: controlMappings.map((m) => ({
+					uuid: m.uuid,
+					status: m.status,
+					description: m.justification || '',
+					cci: m.cci || ''
+				}))
+			};
+		});
+
+		debug(`Exporting ${controlsWithMappings.length} controls as ${format}`);
+
+		switch (format.toLowerCase()) {
+			case 'csv':
+				return exportAsCSV(controlsWithMappings, metadata, mappingsColumn, res);
+			case 'excel':
+			case 'xlsx':
+				return await exportAsExcel(controlsWithMappings, metadata, mappingsColumn, res);
+			case 'json':
+				return exportAsJSON(controlsWithMappings, metadata, res);
+			default:
+				return res.status(400).json({ error: `Unsupported format: ${format}` });
+		}
+	} catch (error: any) {
+		console.error('Export error:', error);
+		res.status(500).json({ error: error.message });
+	}
+});
+
+export function formatMappingEntry(mapping: any): string {
+	const justification = mapping.description || mapping.justification || '';
+	const status = mapping.status || 'Unknown';
+	const cci = mapping.cci || '';
+
+	const finalJustification = justification.trim() !== '' ? justification : `[${status}]`;
+	if (cci.trim() !== '') {
+		return `CCI ${cci}: ${finalJustification}`;
+	}
+
+	return finalJustification;
+}
+
+// Export as CSV
+function exportAsCSV(
+	controls: any[],
+	metadata: any,
+	mappingsColumn: string,
+	res: express.Response
+) {
+	return exportAsCSVWithMapping(controls, metadata, { mappings: mappingsColumn }, res);
+}
+
+// Export as CSV with column mapping support
+function exportAsCSVWithMapping(
+	controls: any[],
+	metadata: any,
+	columnMappings: Record<string, string>,
+	res: express.Response
+) {
+	// Get field schema to use original names
+	const fieldSchema = metadata?.fieldSchema?.fields || {};
+	const controlIdField = metadata?.control_id_field || 'id';
+
+	// Get all unique field names from controls
+	const allFields = new Set<string>();
+	controls.forEach((control) => {
+		Object.keys(control).forEach((key) => allFields.add(key));
+	});
+
+	// Build field list with display names, handling column mappings
+	const fieldMapping: Array<{ fieldName: string; displayName: string; isMappingColumn?: boolean }> =
+		[];
+	const usedDisplayNames = new Set<string>(); // Track used display names to avoid duplicates (case-insensitive)
+
+	// Handle the control ID field first
+	if (allFields.has(controlIdField)) {
+		const idSchema = fieldSchema[controlIdField];
+		const displayName = idSchema?.original_name || 'Control ID';
+
+		// Check if the control ID field should show mappings data instead
+		let isMappingColumn = false;
+		if (columnMappings['mappings']) {
+			const targetDisplayName = columnMappings['mappings'];
+			// Check if this field's display name matches the target
+			if (displayName.toLowerCase() === targetDisplayName.toLowerCase()) {
+				isMappingColumn = true;
+			}
+		}
+
+		fieldMapping.push({ fieldName: controlIdField, displayName, isMappingColumn });
+		usedDisplayNames.add(displayName.toLowerCase());
+		allFields.delete(controlIdField);
+	} else if (allFields.has('id')) {
+		// Check if the 'id' field should show mappings data instead
+		let isMappingColumn = false;
+		const displayName = 'Control ID';
+		if (columnMappings['mappings']) {
+			const targetDisplayName = columnMappings['mappings'];
+			if (displayName.toLowerCase() === targetDisplayName.toLowerCase()) {
+				isMappingColumn = true;
+			}
+		}
+
+		fieldMapping.push({ fieldName: 'id', displayName, isMappingColumn });
+		usedDisplayNames.add('control id');
+		allFields.delete('id');
+	}
+
+	// Handle family field second if it exists
+	if (allFields.has('family')) {
+		const familySchema = fieldSchema['family'];
+		const displayName = familySchema?.original_name || 'Family';
+		fieldMapping.push({ fieldName: 'family', displayName });
+		usedDisplayNames.add(displayName.toLowerCase());
+		allFields.delete('family');
+	}
+
+	// Handle remaining fields, checking if any should be replaced by mappings
+	Array.from(allFields)
+		.filter((field) => field !== 'mappings' && field !== 'mappings_count')
+		.sort()
+		.forEach((field) => {
+			const schema = fieldSchema[field];
+			const defaultDisplayName =
+				schema?.original_name || field.replace(/-/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase());
+
+			// Check if this field should show mappings data instead
+			let isMappingColumn = false;
+			let finalDisplayName = defaultDisplayName;
+
+			// Check if mappings should be exported to this field's column
+			if (columnMappings['mappings']) {
+				const targetDisplayName = columnMappings['mappings'];
+				// Check if this field's display name matches the target
+				if (defaultDisplayName.toLowerCase() === targetDisplayName.toLowerCase()) {
+					isMappingColumn = true;
+					finalDisplayName = targetDisplayName; // Use the exact target name
+				}
+			}
+
+			if (!usedDisplayNames.has(finalDisplayName.toLowerCase())) {
+				fieldMapping.push({
+					fieldName: field,
+					displayName: finalDisplayName,
+					isMappingColumn
+				});
+				usedDisplayNames.add(finalDisplayName.toLowerCase());
+			}
+		});
+
+	// Add regular mappings column if not being exported to another column
+	if (
+		allFields.has('mappings') &&
+		(!columnMappings['mappings'] || columnMappings['mappings'] === 'Mappings')
+	) {
+		fieldMapping.push({ fieldName: 'mappings', displayName: 'Mappings' });
+	}
+
+	// Create CSV header with display names
+	const csvRows = [];
+	csvRows.push(fieldMapping.map((field) => `"${field.displayName}"`).join(','));
+
+	// Add control rows
+	controls.forEach((control) => {
+		const row = fieldMapping.map(({ fieldName, isMappingColumn }) => {
+			let value;
+
+			if (isMappingColumn) {
+				// This column should show mappings data, fallback to original field if no mappings
+				const mappingsValue = control['mappings'];
+				if (Array.isArray(mappingsValue) && mappingsValue.length > 0) {
+					// Show mappings justification - collect all non-empty justifications
+					const mappingsStr = mappingsValue
+						.map((m: any) => m.description || m.justification || '')
+						.filter((desc: string) => desc && desc.trim() !== '')
+						.join('\n');
+
+					if (mappingsStr.trim() !== '') {
+						// We have justifications, use them
+						value = mappingsStr;
+					} else {
+						// No valid justifications, use original field value
+						value = control[fieldName];
+					}
+				} else {
+					// No mappings array, use original field value
+					value = control[fieldName];
+				}
+			} else {
+				// Normal field
+				value = control[fieldName];
+			}
+
+			if (value === undefined || value === null) return '""';
+
+			// Special handling for mappings field when it's a dedicated mappings column
+			if (fieldName === 'mappings' && Array.isArray(value)) {
+				// Format mappings as a readable string with justifications
+				const mappingsStr = value.map((m: any) => formatMappingEntry(m)).join('\n\n');
+				return `"${mappingsStr.replace(/"/g, '""')}"`;
+			}
+
+			if (Array.isArray(value)) return `"${value.join('; ').replace(/"/g, '""')}"`;
+			if (typeof value === 'object') return `"${JSON.stringify(value).replace(/"/g, '""')}"`;
+			return `"${String(value).replace(/"/g, '""')}"`;
+		});
+		csvRows.push(row.join(','));
+	});
+
+	const csvContent = csvRows.join('\n');
+	const fileName = `${metadata?.name || 'controls'}_export_${Date.now()}.csv`;
+
+	res.setHeader('Content-Type', 'text/csv');
+	res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+	res.send(csvContent);
+}
+
+// Export as Excel
+async function exportAsExcel(
+	controls: any[],
+	metadata: any,
+	mappingsColumn: string,
+	res: express.Response
+) {
+	return await exportAsExcelWithMapping(controls, metadata, { mappings: mappingsColumn }, res);
+}
+
+// Export as Excel with column mapping support
+async function exportAsExcelWithMapping(
+	controls: any[],
+	metadata: any,
+	columnMappings: Record<string, string>,
+	res: express.Response
+) {
+	// Get field schema to use original names
+	const fieldSchema = metadata?.fieldSchema?.fields || {};
+	const controlIdField = metadata?.control_id_field || 'id';
+
+	// Get all unique field names from controls
+	const allFields = new Set<string>();
+	controls.forEach((control) => {
+		Object.keys(control).forEach((key) => allFields.add(key));
+	});
+
+	// Build field list with display names, handling column mappings
+	const fieldMapping: Array<{ fieldName: string; displayName: string; isMappingColumn?: boolean }> =
+		[];
+	const usedDisplayNames = new Set<string>(); // Track used display names to avoid duplicates (case-insensitive)
+
+	// Handle the control ID field first
+	if (allFields.has(controlIdField)) {
+		const idSchema = fieldSchema[controlIdField];
+		const displayName = idSchema?.original_name || 'Control ID';
+
+		// Check if the control ID field should show mappings data instead
+		let isMappingColumn = false;
+		if (columnMappings['mappings']) {
+			const targetDisplayName = columnMappings['mappings'];
+			// Check if this field's display name matches the target
+			if (displayName.toLowerCase() === targetDisplayName.toLowerCase()) {
+				isMappingColumn = true;
+			}
+		}
+
+		fieldMapping.push({ fieldName: controlIdField, displayName, isMappingColumn });
+		usedDisplayNames.add(displayName.toLowerCase());
+		allFields.delete(controlIdField);
+	} else if (allFields.has('id')) {
+		// Check if the 'id' field should show mappings data instead
+		let isMappingColumn = false;
+		const displayName = 'Control ID';
+		if (columnMappings['mappings']) {
+			const targetDisplayName = columnMappings['mappings'];
+			if (displayName.toLowerCase() === targetDisplayName.toLowerCase()) {
+				isMappingColumn = true;
+			}
+		}
+
+		fieldMapping.push({ fieldName: 'id', displayName, isMappingColumn });
+		usedDisplayNames.add('control id');
+		allFields.delete('id');
+	}
+
+	// Handle family field second if it exists
+	if (allFields.has('family')) {
+		const familySchema = fieldSchema['family'];
+		const displayName = familySchema?.original_name || 'Family';
+		fieldMapping.push({ fieldName: 'family', displayName });
+		usedDisplayNames.add(displayName.toLowerCase());
+		allFields.delete('family');
+	}
+
+	// Handle remaining fields, checking if any should be replaced by mappings
+	Array.from(allFields)
+		.filter((field) => field !== 'mappings' && field !== 'mappings_count')
+		.sort()
+		.forEach((field) => {
+			const schema = fieldSchema[field];
+			const defaultDisplayName =
+				schema?.original_name || field.replace(/-/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase());
+
+			// Check if this field should show mappings data instead
+			let isMappingColumn = false;
+			let finalDisplayName = defaultDisplayName;
+
+			// Check if mappings should be exported to this field's column
+			if (columnMappings['mappings']) {
+				const targetDisplayName = columnMappings['mappings'];
+				// Check if this field's display name matches the target
+				if (defaultDisplayName.toLowerCase() === targetDisplayName.toLowerCase()) {
+					isMappingColumn = true;
+					finalDisplayName = targetDisplayName; // Use the exact target name
+				}
+			}
+
+			if (!usedDisplayNames.has(finalDisplayName.toLowerCase())) {
+				fieldMapping.push({
+					fieldName: field,
+					displayName: finalDisplayName,
+					isMappingColumn
+				});
+				usedDisplayNames.add(finalDisplayName.toLowerCase());
+			}
+		});
+
+	// Add regular mappings column if not being exported to another column
+	if (
+		allFields.has('mappings') &&
+		(!columnMappings['mappings'] || columnMappings['mappings'] === 'Mappings')
+	) {
+		fieldMapping.push({ fieldName: 'mappings', displayName: 'Mappings' });
+	}
+
+	// Prepare data for Excel with the field mapping
+	const worksheetData = controls.map((control) => {
+		const exportControl: any = {};
+
+		fieldMapping.forEach(({ fieldName, displayName, isMappingColumn }) => {
+			let value;
+
+			if (isMappingColumn) {
+				// This column should show mappings data, fallback to original field if no mappings
+				const mappingsValue = control['mappings'];
+				if (Array.isArray(mappingsValue) && mappingsValue.length > 0) {
+					// Show mappings justification using consistent formatting
+					const mappingsStr = mappingsValue.map((m: any) => formatMappingEntry(m)).join('\n\n');
+					// Use the formatted mappings string
+					value = mappingsStr;
+				} else {
+					// No mappings array, use original field value
+					value = control[fieldName];
+				}
+			} else {
+				// Normal field
+				value = control[fieldName];
+			}
+
+			// Special handling for mappings field when it's a dedicated mappings column
+			if (fieldName === 'mappings' && Array.isArray(value)) {
+				const mappingsStr = value.map((m: any) => formatMappingEntry(m)).join('\n\n');
+				exportControl[displayName] = mappingsStr;
+			} else if (Array.isArray(value)) {
+				exportControl[displayName] = value.join('; ');
+			} else if (typeof value === 'object' && value !== null) {
+				exportControl[displayName] = JSON.stringify(value);
+			} else {
+				exportControl[displayName] = value;
+			}
+		});
+
+		return exportControl;
+	});
+
+	// Create workbook and worksheet with xlsx-republish
+	const wb = XLSX.utils.book_new();
+
+	// Convert worksheetData to worksheet format
+	const ws = XLSX.utils.json_to_sheet(worksheetData);
+	XLSX.utils.book_append_sheet(wb, ws, 'Controls');
+
+	// Create metadata sheet if available
+	if (metadata) {
+		const cleanMetadata = { ...metadata };
+		delete cleanMetadata.fieldSchema; // Remove large schema object
+
+		// Convert metadata to array of objects for sheet creation
+		const metadataArray = Object.entries(cleanMetadata).map(([key, value]) => ({
+			Property: key,
+			Value: String(value)
+		}));
+
+		const metaSheet = XLSX.utils.json_to_sheet(metadataArray);
+		XLSX.utils.book_append_sheet(wb, metaSheet, 'Metadata');
+	}
+
+	// Generate Excel buffer
+	const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+	const fileName = `${metadata?.name || 'controls'}_export_${Date.now()}.xlsx`;
+
+	res.setHeader(
+		'Content-Type',
+		'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+	);
+	res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+	res.send(buffer);
+}
+
+// Export as JSON
+function exportAsJSON(controls: any[], metadata: any, res: express.Response) {
+	const exportData = {
+		metadata: metadata || {},
+		controlCount: controls.length,
+		exportedAt: new Date().toISOString(),
+		controls: controls
+	};
+
+	const fileName = `${metadata?.name || 'controls'}_export_${Date.now()}.json`;
+
+	res.setHeader('Content-Type', 'application/json');
+	res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+	res.json(exportData);
+}
+
+// Get available column headers for export
+router.get('/export-column-headers', async (req, res) => {
+	try {
+		let metadata: any = {};
+		try {
+			const controlSetPath = getCurrentControlSetPath();
+			const metadataPath = join(controlSetPath, 'controlloom.yaml');
+			if (existsSync(metadataPath)) {
+				const metadataContent = readFileSync(metadataPath, 'utf8');
+				metadata = yaml.load(metadataContent) as any;
+			} else {
+				return res
+					.status(404)
+					.json({ error: `No controlloom.yaml file found in control set path: ${controlSetPath}` });
+			}
+		} catch {
+			return res.status(500).json({ error: 'Failed to read controlloom.yaml file' });
+		}
+
+		const fieldSchema = metadata?.fieldSchema?.fields || {};
+		const controlIdField = metadata?.control_id_field || 'id';
+
+		const columnHeaders: Array<{ value: string; label: string }> = [];
+
+		if (fieldSchema[controlIdField]) {
+			const idSchema = fieldSchema[controlIdField];
+			const displayName = idSchema?.original_name || 'Control ID';
+			columnHeaders.push({
+				value: displayName,
+				label: displayName
+			});
+		} else {
+			columnHeaders.push({ value: 'Control ID', label: 'Control ID' });
+		}
+
+		if (fieldSchema['family']) {
+			const familySchema = fieldSchema['family'];
+			const displayName = familySchema?.original_name || 'Family';
+			columnHeaders.push({
+				value: displayName,
+				label: displayName
+			});
+		}
+
+		Object.entries(fieldSchema).forEach(([fieldName, schema]: [string, any]) => {
+			if (
+				fieldName === controlIdField ||
+				fieldName === 'family' ||
+				fieldName === 'mappings' ||
+				fieldName === 'mappings_count'
+			) {
+				return;
+			}
+
+			const displayName =
+				schema?.original_name ||
+				fieldName.replace(/-/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase());
+			columnHeaders.push({
+				value: displayName,
+				label: displayName
+			});
+		});
+
+		columnHeaders.push({ value: 'Mappings', label: 'Mappings (Default)' });
+
+		res.json({
+			columnHeaders,
+			defaultColumn: 'Mappings'
+		});
+	} catch (error: any) {
+		res.status(500).json({ error: error.message });
+	}
+});
+
+// Export with specific column selection and mapping
+router.post('/export-csv', async (req, res) => {
+	try {
+		const { format = 'csv', _columns = [], columnMappings = {} } = req.body;
+
+		const state = getServerState();
+		const fileStore = state.fileStore;
+
+		if (!fileStore) {
+			return res.status(500).json({ error: 'No control set loaded' });
+		}
+
+		// Load all controls and mappings
+		const controls = await fileStore.loadAllControls();
+		const mappings = await fileStore.loadMappings();
+
+		// Load metadata from controlloom.yaml file
+		let metadata: any = {};
+		try {
+			const controlSetPath = getCurrentControlSetPath();
+			const metadataPath = join(controlSetPath, 'controlloom.yaml');
+			if (existsSync(metadataPath)) {
+				const metadataContent = readFileSync(metadataPath, 'utf8');
+				metadata = yaml.load(metadataContent) as any;
+			}
+		} catch (err) {
+			debug('Could not load metadata:', err);
+		}
+
+		if (!controls || controls.length === 0) {
+			return res.status(404).json({ error: 'No controls found' });
+		}
+
+		// Combine controls with their mappings
+		const controlIdField = metadata?.control_id_field || 'id';
+		const controlsWithMappings = controls.map((control) => {
+			const controlId = control[controlIdField] || control.id;
+			const controlMappings = mappings.filter((m) => m.control_id === controlId);
+			return {
+				...control,
+				mappings_count: controlMappings.length,
+				mappings: controlMappings.map((m) => ({
+					uuid: m.uuid,
+					status: m.status,
+					description: m.justification || '',
+					cci: m.cci || ''
+				}))
+			};
+		});
+
+		debug(`Exporting ${controlsWithMappings.length} controls as ${format} with column mappings`);
+
+		// Use custom export function with column mapping
+		return exportAsCSVWithMapping(controlsWithMappings, metadata, columnMappings, res);
+	} catch (error: any) {
+		console.error('Export error:', error);
+		res.status(500).json({ error: error.message });
+	}
+});
+
+// Parse Excel/CSV file for preview (used by frontend)
+router.post('/parse-excel', upload.single('file'), async (req, res) => {
+	try {
+		if (!req.file) {
+			return res.status(400).json({ error: 'No file uploaded' });
+		}
+
+		const fileName = req.file.originalname || '';
+		const isCSV = fileName.toLowerCase().endsWith('.csv');
+		let sheets: string[] = [];
+		let rows: any[][] = [];
+
+		if (isCSV) {
+			// Parse CSV file
+			const csvContent = req.file.buffer.toString('utf-8');
+			rows = parseCSV(csvContent);
+			sheets = ['Sheet1']; // CSV files only have one "sheet"
+		} else {
+			// Parse Excel file with xlsx-republish
+			const workbook = XLSX.read(req.file.buffer, { type: 'buffer' });
+
+			// Get all sheet names
+			sheets = workbook.SheetNames;
+
+			// Parse first sheet by default
+			const worksheetName = workbook.SheetNames[0];
+			if (!worksheetName) {
+				return res.status(400).json({ error: 'No worksheet found in file' });
+			}
+
+			const worksheet = workbook.Sheets[worksheetName];
+			// Get data from the worksheet
+			rows = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: null });
+		}
+
+		// Find potential header rows (first 5 non-empty rows)
+		const headerCandidates = rows.slice(0, MAX_HEADER_CANDIDATES).map((row, index) => ({
+			row: index + 1,
+			preview:
+				row
+					.slice(0, PREVIEW_COLUMNS)
+					.filter((v) => v !== null)
+					.filter((v) => v !== undefined)
+					.join(', ') + (row.length > 4 ? ', ...' : '')
+		}));
+
+		res.json({
+			sheets,
+			selectedSheet: sheets[0],
+			rowPreviews: headerCandidates,
+			totalRows: rows.length,
+			sampleData: rows.slice(0, 10) // First 10 rows for preview
+		});
+	} catch (error) {
+		console.error('Error parsing Excel file:', error);
+		res.status(500).json({ error: 'Failed to parse Excel file' });
+	}
+});
+
+// Get data from specific sheet
+router.post('/parse-excel-sheet', upload.single('file'), async (req, res) => {
+	try {
+		const { sheetName, headerRow } = req.body;
+
+		if (!req.file) {
+			return res.status(400).json({ error: 'No file uploaded' });
+		}
+
+		const fileName = req.file.originalname || '';
+		const isCSV = fileName.toLowerCase().endsWith('.csv');
+		let rows: any[][] = [];
+
+		if (isCSV) {
+			// Parse CSV file
+			const csvContent = req.file.buffer.toString('utf-8');
+			rows = parseCSV(csvContent);
+		} else {
+			// Parse Excel file with xlsx-republish
+			const workbook = XLSX.read(req.file.buffer, { type: 'buffer' });
+
+			// Check if sheet exists
+			if (!workbook.SheetNames.includes(sheetName)) {
+				return res.status(400).json({ error: `Sheet "${sheetName}" not found` });
+			}
+
+			// Get specific sheet
+			const worksheet = workbook.Sheets[sheetName];
+			// Get data from the worksheet
+			rows = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: null });
+		}
+
+		const headerRowIndex = parseInt(headerRow) - 1;
+		const headers = rows[headerRowIndex] || [];
+		const fields = headers.filter((h: any) => h && typeof h === 'string');
+
+		// Get sample data
+		const sampleData = rows.slice(headerRowIndex + 1, headerRowIndex + 4).map((row) => {
+			const obj: any = {};
+			headers.forEach((header: string, index: number) => {
+				if (header) {
+					obj[header] = row[index];
+				}
+			});
+			return obj;
+		});
+
+		res.json({
+			fields,
+			sampleData,
+			controlCount: rows.length - headerRowIndex - 1
+		});
+	} catch (error) {
+		console.error('Error parsing Excel sheet:', error);
+		res.status(500).json({ error: 'Failed to parse Excel sheet' });
+	}
+});
+
+router.post('/parse-excel-sheet-previews', upload.single('file'), async (req, res) => {
+	try {
+		const { sheetName } = req.body;
+
+		if (!req.file) {
+			return res.status(400).json({ error: 'No file uploaded' });
+		}
+
+		const fileName = req.file.originalname || '';
+		const isCSV = fileName.toLowerCase().endsWith('.csv');
+		let rows: any[][] = [];
+
+		if (isCSV) {
+			const csvContent = req.file.buffer.toString('utf-8');
+			rows = parseCSV(csvContent);
+		} else {
+			const workbook = XLSX.read(req.file.buffer, { type: 'buffer' });
+
+			if (!workbook.SheetNames.includes(sheetName)) {
+				return res.status(400).json({ error: `Sheet "${sheetName}" not found` });
+			}
+
+			const worksheet = workbook.Sheets[sheetName];
+			rows = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: null });
+		}
+
+		const headerCandidates = rows.slice(0, MAX_HEADER_CANDIDATES).map((row, index) => ({
+			row: index + 1,
+			preview:
+				row
+					.slice(0, PREVIEW_COLUMNS)
+					.filter((v) => v !== null)
+					.filter((v) => v !== undefined)
+					.join(', ') + (row.length > 4 ? ', ...' : '')
+		}));
+
+		res.json({
+			rowPreviews: headerCandidates,
+			totalRows: rows.length
+		});
+	} catch (error) {
+		console.error('Error getting sheet previews:', error);
+		res.status(500).json({ error: 'Failed to get sheet previews' });
+	}
+});
+
+router.get('/git-status', async (req, res) => {
+	try {
+		const state = getServerState();
+		const gitUtil = new GitHistoryUtil(state.CONTROL_SET_DIR);
+
+		const gitStatus = await gitUtil.getGitStatus();
+		res.json(gitStatus);
+	} catch (error) {
+		console.error('Error getting git status:', error);
+		res.status(500).json({ error: 'Failed to get git status' });
+	}
+});
+
+router.post('/git-pull', async (req, res) => {
+	try {
+		const state = getServerState();
+		const gitUtil = new GitHistoryUtil(state.CONTROL_SET_DIR);
+
+		const result = await gitUtil.pullChanges();
+		if (result.success) {
+			res.json(result);
+		} else {
+			res.status(400).json(result);
+		}
+	} catch (error) {
+		console.error('Error pulling changes:', error);
+		res.status(500).json({ error: 'Failed to pull changes' });
+	}
+});
+
+export default router;

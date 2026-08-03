@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Adrien Murillo
+
+kind: EvidenceBundle
+metadata:
+  name: duplicate-annotation-fixture
+  description: Test that duplicate ControlLoom UUID annotations are ignored.
+
+components:
+  # @controlloomStart 643060b2-0ddf-4728-9582-ef38dca7447a
+  - name: policy-api
+    source: src/policy/api.ts
+  # @controlloomEnd 643060b2-0ddf-4728-9582-ef38dca7447a
+
+  # @controlloomStart 643060b2-0ddf-4728-9582-ef38dca7447a
+  - name: policy-worker
+    source: src/policy/worker.ts
+  # @controlloomEnd 643060b2-0ddf-4728-9582-ef38dca7447a

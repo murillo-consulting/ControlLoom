@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">ControlLoom</title>
+  <desc id="desc">Three interwoven teal control bands inside a dark rounded square.</desc>
+  <defs>
+    <linearGradient id="bg" x1="8" y1="4" x2="56" y2="60" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#172033"/>
+      <stop offset="1" stop-color="#080d18"/>
+    </linearGradient>
+    <linearGradient id="thread" x1="15" y1="15" x2="50" y2="50" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#5eead4"/>
+      <stop offset="1" stop-color="#0d9488"/>
+    </linearGradient>
+  </defs>
+  <rect x="3" y="3" width="58" height="58" rx="15" fill="url(#bg)" stroke="#2dd4bf" stroke-opacity=".35" stroke-width="2"/>
+  <path d="M18 17h18a10 10 0 0 1 10 10v20" fill="none" stroke="url(#thread)" stroke-width="6" stroke-linecap="round"/>
+  <path d="M46 47H28a10 10 0 0 1-10-10V17" fill="none" stroke="url(#thread)" stroke-width="6" stroke-linecap="round"/>
+  <path d="M17 32h30" fill="none" stroke="#99f6e4" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="32" cy="32" r="4" fill="#f8fafc"/>
+</svg>

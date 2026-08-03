@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Adrien Murillo
+
+# @controlloomStart 123e4567-e89b-12d3-a456-426614174001
+company:
+  name: "Example Security Lab"
+  location: "Example City"
+  industry: "Technology"
+# @controlloomEnd 123e4567-e89b-12d3-a456-426614174001
+
+products:
+  # @controlloomStart 987e4567-e89b-12d3-a456-426614174777
+  - name: "ControlLoom"
+    version: "1.0.0"
+    description: "A policy engine for Kubernetes"
+    license: "Apache-2.0"
+  # @controlloomEnd 987e4567-e89b-12d3-a456-426614174777
+  - name: "Pepr"
+    version: "1.0.0"
+    description: "An operator and admission controller framework for Kubernetes"
+    license: "Apache-2.0"

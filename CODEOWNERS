@@ -1,0 +1,6 @@
+* @murillo-consulting
+
+# Additional privileged files
+/CODEOWNERS @jeff-mccoy @daveworth
+/cosign.pub @jeff-mccoy @daveworth
+/LICENSE @jeff-mccoy @austenbryan

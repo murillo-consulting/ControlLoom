@@ -1,0 +1,2120 @@
+// SPDX-License-Identifier: Apache-2.0
+
+// SPDX-FileCopyrightText: 2026 Adrien Murillo
+// Modified in 2026 by Adrien Murillo for ControlLoom.
+
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import * as crypto from 'crypto';
+import fs from 'fs';
+import { Octokit } from '@octokit/rest';
+import {
+	getPRContext,
+	fetchRawFileViaAPI,
+	extractMapBlocks,
+	getChangedBlocks,
+	getRemovedBlocks,
+	crawlCommand,
+	postFinding,
+	deleteOldIssueComments,
+	deleteOldReviewComments,
+	dismissOldReviews,
+	containsControlLoomAnnotations,
+	findOptimalPairings,
+	CONTROLLOOM_SIGNATURE
+} from './crawl';
+
+vi.mock('fs', () => {
+	const readFileSync = vi.fn();
+	return { default: { readFileSync } };
+});
+const fsMock = fs as unknown as { readFileSync: ReturnType<typeof vi.fn> };
+
+const pullsGet = vi.fn();
+const pullsListFiles = vi.fn();
+const pullsCreateReview = vi.fn();
+const pullsListReviewComments = vi.fn();
+const pullsDeleteReviewComment = vi.fn();
+const pullsListReviews = vi.fn();
+const pullsDismissReview = vi.fn();
+
+const reposGetContent = vi.fn();
+
+const issuesCreateComment = vi.fn();
+const issuesListComments = vi.fn();
+const issuesDeleteComment = vi.fn();
+
+const mockOctokitInstance = {
+	pulls: {
+		get: pullsGet,
+		listFiles: pullsListFiles,
+		createReview: pullsCreateReview,
+		listReviewComments: pullsListReviewComments,
+		deleteReviewComment: pullsDeleteReviewComment,
+		listReviews: pullsListReviews,
+		dismissReview: pullsDismissReview
+	},
+	repos: { getContent: reposGetContent },
+	issues: {
+		createComment: issuesCreateComment,
+		listComments: issuesListComments,
+		deleteComment: issuesDeleteComment
+	}
+};
+
+vi.mock('@octokit/rest', () => {
+	const Octokit = vi.fn(function Octokit(this: any, ..._args: any[]) {
+		return mockOctokitInstance as any;
+	});
+	return { Octokit };
+});
+
+const originalEnv = { ...process.env };
+const resetEnv = () => {
+	process.env = { ...originalEnv };
+	delete process.env.GITHUB_EVENT_PATH;
+	delete process.env.GITHUB_REPOSITORY;
+	delete process.env.OWNER;
+	delete process.env.REPO;
+	delete process.env.PULL_NUMBER;
+	delete process.env.GITHUB_TOKEN;
+};
+
+let logSpy: ReturnType<typeof vi.spyOn>;
+let errSpy: ReturnType<typeof vi.spyOn>;
+let stderrSpy: ReturnType<typeof vi.spyOn>;
+
+beforeEach(() => {
+	vi.clearAllMocks();
+
+	issuesListComments.mockResolvedValue({ data: [] });
+	issuesDeleteComment.mockResolvedValue({});
+
+	pullsDeleteReviewComment.mockResolvedValue({});
+	pullsListReviews.mockResolvedValue({ data: [] });
+	pullsDismissReview.mockResolvedValue({});
+
+	pullsGet.mockResolvedValue({
+		data: { head: { ref: 'main', sha: 'main-sha' }, base: { sha: 'base-sha-123' } }
+	});
+	pullsListFiles.mockResolvedValue({ data: [] });
+
+	reposGetContent.mockResolvedValue({ data: '' });
+
+	logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+	errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+	stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true as any);
+
+	resetEnv();
+});
+
+afterEach(() => {
+	logSpy.mockRestore();
+	errSpy.mockRestore();
+	stderrSpy.mockRestore();
+	resetEnv();
+});
+
+describe('getPRContext', () => {
+	it('throws error if required env vars are missing (no event payload, no fallbacks)', () => {
+		expect(() => getPRContext()).toThrow(
+			'Set OWNER, REPO, and PULL_NUMBER in the environment for local use.'
+		);
+	});
+
+	it('reads from GitHub event payload when GITHUB_EVENT_PATH and GITHUB_REPOSITORY are set', () => {
+		process.env.GITHUB_EVENT_PATH = '/path/to/event.json';
+		process.env.GITHUB_REPOSITORY = 'octo-org/octo-repo';
+		fsMock.readFileSync.mockReturnValueOnce(JSON.stringify({ pull_request: { number: 42 } }));
+
+		const ctx = getPRContext();
+		expect(ctx).toEqual({ owner: 'octo-org', repo: 'octo-repo', pull_number: 42 });
+		expect(fsMock.readFileSync).toHaveBeenCalledWith('/path/to/event.json', 'utf8');
+	});
+
+	it('throws when GitHub event payload lacks PR number', () => {
+		process.env.GITHUB_EVENT_PATH = '/path/to/event.json';
+		process.env.GITHUB_REPOSITORY = 'octo-org/octo-repo';
+		fsMock.readFileSync.mockReturnValueOnce(JSON.stringify({ pull_request: {} }));
+
+		expect(() => getPRContext()).toThrow('PR number not found in GitHub event payload.');
+	});
+
+	it('falls back to OWNER/REPO/PULL_NUMBER env vars when event payload is absent', () => {
+		process.env.OWNER = 'me';
+		process.env.REPO = 'mine';
+		process.env.PULL_NUMBER = '123';
+
+		const ctx = getPRContext();
+		expect(ctx).toEqual({ owner: 'me', repo: 'mine', pull_number: 123 });
+	});
+});
+
+describe('fetchRawFileViaAPI', () => {
+	it('returns string data directly when GitHub API returns raw string', async () => {
+		const octokit = new Octokit();
+		reposGetContent.mockResolvedValueOnce({ data: 'plain text file content' });
+
+		const out = await fetchRawFileViaAPI({
+			octokit,
+			owner: 'o',
+			repo: 'r',
+			path: 'p.txt',
+			ref: 'main'
+		});
+
+		expect(out).toBe('plain text file content');
+		expect(reposGetContent).toHaveBeenCalledWith({
+			owner: 'o',
+			repo: 'r',
+			path: 'p.txt',
+			ref: 'main',
+			headers: { accept: 'application/vnd.github.v3.raw' }
+		});
+	});
+
+	it('decodes base64 when GitHub API returns a content object', async () => {
+		const octokit = new Octokit();
+		const content = Buffer.from('decoded content here', 'utf8').toString('base64');
+		reposGetContent.mockResolvedValueOnce({ data: { content } });
+
+		const out = await fetchRawFileViaAPI({
+			octokit,
+			owner: 'o',
+			repo: 'r',
+			path: 'p.txt',
+			ref: 'main'
+		});
+
+		expect(out).toBe('decoded content here');
+	});
+
+	it('throws on unexpected shape', async () => {
+		const octokit = new Octokit();
+		reposGetContent.mockResolvedValueOnce({ data: { weird: true } });
+
+		await expect(
+			fetchRawFileViaAPI({
+				octokit,
+				owner: 'o',
+				repo: 'r',
+				path: 'p.txt',
+				ref: 'main'
+			})
+		).rejects.toThrow('Unexpected GitHub API response shape');
+	});
+});
+
+describe('extractMapBlocks & getChangedBlocks', () => {
+	const uuid = '123e4567-e89b-12d3-a456-426614174000';
+	const oldText = [
+		'header',
+		`// @controlloomStart ${uuid}`,
+		'old line',
+		`// @controlloomEnd ${uuid}`,
+		'footer'
+	].join('\n');
+
+	const newTextChanged = [
+		'header',
+		`// @controlloomStart ${uuid}`,
+		'new line changed',
+		`// @controlloomEnd ${uuid}`,
+		'footer'
+	].join('\n');
+
+	const newTextUnchanged = oldText;
+
+	it('extracts blocks with correct line ranges', () => {
+		const blocks = extractMapBlocks(oldText);
+		expect(blocks).toHaveLength(1);
+		const [b] = blocks;
+		expect(b.startLine).toBe(1);
+		expect(b.endLine).toBe(4);
+		expect(b.uuid).toBe(uuid);
+	});
+
+	it('detects changes in blocks between texts', () => {
+		const changed = getChangedBlocks(oldText, newTextChanged);
+		expect(changed).toHaveLength(1);
+		expect(changed[0].uuid).toBe(uuid);
+
+		const unchanged = getChangedBlocks(oldText, newTextUnchanged);
+		expect(unchanged).toHaveLength(0);
+	});
+
+	it('skips new blocks that have no matching old block (no oldMatch)', () => {
+		const uuid = '123e4567-e89b-12d3-a456-426614174000';
+		const oldText = 'header\nfooter';
+		const newText = [
+			'header',
+			`// @controlloomStart ${uuid}`,
+			'new content',
+			`// @controlloomEnd ${uuid}`,
+			'footer'
+		].join('\n');
+
+		const changed = getChangedBlocks(oldText, newText);
+		expect(changed).toHaveLength(0);
+	});
+
+	it('should not detect changes when lines are inserted above a block (line shift scenario)', () => {
+		const uuid = '123e4567-e89b-12d3-a456-426614174000';
+
+		const oldText = [
+			'header',
+			`// @controlloomStart ${uuid}`,
+			'unchanged content line 1',
+			'unchanged content line 2',
+			`// @controlloomEnd ${uuid}`,
+			'footer'
+		].join('\n');
+
+		const newTextWithInsertionAbove = [
+			'header',
+			'NEWLY INSERTED LINE 1',
+			'NEWLY INSERTED LINE 2',
+			`// @controlloomStart ${uuid}`,
+			'unchanged content line 1',
+			'unchanged content line 2',
+			`// @controlloomEnd ${uuid}`,
+			'footer'
+		].join('\n');
+
+		const changed = getChangedBlocks(oldText, newTextWithInsertionAbove);
+		expect(changed).toHaveLength(0);
+	});
+
+	it('should detect actual content changes within a block even when line positions shift', () => {
+		const uuid = '123e4567-e89b-12d3-a456-426614174000';
+
+		const oldText = [
+			'header',
+			`// @controlloomStart ${uuid}`,
+			'original content line 1',
+			'original content line 2',
+			`// @controlloomEnd ${uuid}`,
+			'footer'
+		].join('\n');
+
+		const newTextWithInsertionAndChange = [
+			'header',
+			'NEWLY INSERTED LINE',
+			`// @controlloomStart ${uuid}`,
+			'CHANGED content line 1',
+			'original content line 2',
+			`// @controlloomEnd ${uuid}`,
+			'footer'
+		].join('\n');
+
+		const changed = getChangedBlocks(oldText, newTextWithInsertionAndChange);
+		expect(changed).toHaveLength(1);
+		expect(changed[0].uuid).toBe(uuid);
+	});
+
+	it('should use weight-based optimal pairing for duplicate UUID blocks (UDS Core scenario)', () => {
+		const uuid = '643060b2-0ddf-4728-9582-ef38dca7447a';
+
+		// Original scenario: single block with UUID
+		const oldText = [
+			'# SPDX-License-Identifier: Apache-2.0',
+			'apiVersion: v1',
+			'kind: Service',
+			`# @controlloomStart ${uuid}`,
+			'---',
+			'apiVersion: networking.istio.io/v1beta1',
+			'kind: VirtualService',
+			'metadata:',
+			'  name: uds-core-admin-app-vs',
+			'  namespace: uds-core-admin',
+			`# @controlloomEnd ${uuid}`,
+			''
+		].join('\n');
+
+		// New scenario: original block unchanged + new block added with same UUID
+		const newText = [
+			'# SPDX-License-Identifier: Apache-2.0',
+			'apiVersion: v1',
+			'kind: Service',
+			`# @controlloomStart ${uuid}`,
+			'---',
+			'apiVersion: networking.istio.io/v1beta1',
+			'kind: VirtualService',
+			'metadata:',
+			'  name: uds-core-admin-app-vs',
+			'  namespace: uds-core-admin',
+			`# @controlloomEnd ${uuid}`,
+			'',
+			`# @controlloomStart ${uuid}`,
+			'---',
+			'apiVersion: v1',
+			'kind: Service',
+			'metadata:',
+			'  name: new-service',
+			'  namespace: uds-core-admin',
+			`# @controlloomEnd ${uuid}`,
+			''
+		].join('\n');
+
+		// Should detect NO changes because original content still exists unchanged
+		const changed = getChangedBlocks(oldText, newText);
+		expect(changed).toHaveLength(0);
+	});
+
+	it('should detect changes when duplicate UUID block content is actually modified', () => {
+		const uuid = '643060b2-0ddf-4728-9582-ef38dca7447a';
+
+		// Original: two blocks with same UUID
+		const oldText = [
+			`# @controlloomStart ${uuid}`,
+			'original block 1 content',
+			'line 2 of block 1',
+			`# @controlloomEnd ${uuid}`,
+			'',
+			`# @controlloomStart ${uuid}`,
+			'original block 2 content',
+			'line 2 of block 2',
+			`# @controlloomEnd ${uuid}`
+		].join('\n');
+
+		// Modified: one block moved and content changed, other block unchanged
+		const newText = [
+			`# @controlloomStart ${uuid}`,
+			'MODIFIED block 2 content',
+			'line 2 of block 2 CHANGED',
+			`# @controlloomEnd ${uuid}`,
+			'',
+			`# @controlloomStart ${uuid}`,
+			'original block 1 content',
+			'line 2 of block 1',
+			`# @controlloomEnd ${uuid}`
+		].join('\n');
+
+		const changed = getChangedBlocks(oldText, newText);
+		expect(changed).toHaveLength(1);
+		expect(changed[0].uuid).toBe(uuid);
+		// Should detect the first block (which contains the modified content)
+		expect(changed[0].startLine).toBe(0);
+		expect(changed[0].endLine).toBe(4);
+	});
+
+	it('should properly pair blocks based on content similarity over position', () => {
+		const uuid = '643060b2-0ddf-4728-9582-ef38dca7447a';
+
+		// Original: two distinct blocks
+		const oldText = [
+			`# @controlloomStart ${uuid}`,
+			'block A content',
+			`# @controlloomEnd ${uuid}`,
+			'',
+			`# @controlloomStart ${uuid}`,
+			'block B content',
+			`# @controlloomEnd ${uuid}`
+		].join('\n');
+
+		// New: blocks swapped positions, block B content modified
+		const newText = [
+			`# @controlloomStart ${uuid}`,
+			'block B content MODIFIED',
+			`# @controlloomEnd ${uuid}`,
+			'',
+			`# @controlloomStart ${uuid}`,
+			'block A content',
+			`# @controlloomEnd ${uuid}`
+		].join('\n');
+
+		const changed = getChangedBlocks(oldText, newText);
+		expect(changed).toHaveLength(1);
+		expect(changed[0].uuid).toBe(uuid);
+		// Should pair based on content similarity and detect the modified block B
+		// (even though it's now in first position)
+		expect(changed[0].startLine).toBe(0);
+		expect(changed[0].endLine).toBe(3);
+	});
+});
+
+describe('findOptimalPairings', () => {
+	const uuid = '123e4567-e89b-12d3-a456-426614174000';
+
+	it('should pair identical blocks correctly based on content similarity', () => {
+		const oldBlocks = [
+			{ uuid, startLine: 0, endLine: 3 },
+			{ uuid, startLine: 5, endLine: 8 }
+		];
+		const newBlocks = [
+			{ uuid, startLine: 10, endLine: 13 }, // moved but same content as second old block
+			{ uuid, startLine: 15, endLine: 18 } // moved but same content as first old block
+		];
+
+		const oldLines = [
+			'@controlloomStart',
+			'block A content',
+			'line 2 of A',
+			'@controlloomEnd',
+			'',
+			'@controlloomStart',
+			'block B content',
+			'line 2 of B',
+			'@controlloomEnd'
+		];
+
+		const newLines = [
+			'some other content',
+			'...',
+			'...',
+			'...',
+			'...',
+			'...',
+			'...',
+			'...',
+			'...',
+			'...',
+			'@controlloomStart',
+			'block B content',
+			'line 2 of B',
+			'@controlloomEnd',
+			'',
+			'@controlloomStart',
+			'block A content',
+			'line 2 of A',
+			'@controlloomEnd'
+		];
+
+		const pairings = findOptimalPairings(oldBlocks, newBlocks, oldLines, newLines);
+
+		expect(pairings).toHaveLength(2);
+
+		// Should pair based on content similarity, not position
+		// Old block 0 (A content) should pair with new block 1 (A content at lines 15-18)
+		// Old block 1 (B content) should pair with new block 0 (B content at lines 10-13)
+
+		const pairing1 = pairings.find((p) => p.oldBlock.startLine === 0);
+		const pairing2 = pairings.find((p) => p.oldBlock.startLine === 5);
+
+		expect(pairing1).toBeDefined();
+		expect(pairing2).toBeDefined();
+
+		// Block A (old index 0) should pair with new block at line 15 (content match)
+		expect(pairing1!.newBlock.startLine).toBe(15);
+
+		// Block B (old index 1) should pair with new block at line 10 (content match)
+		expect(pairing2!.newBlock.startLine).toBe(10);
+	});
+
+	it('should use positional similarity as tiebreaker when content is different', () => {
+		const oldBlocks = [
+			{ uuid, startLine: 0, endLine: 3 },
+			{ uuid, startLine: 5, endLine: 8 }
+		];
+		const newBlocks = [
+			{ uuid, startLine: 1, endLine: 4 }, // close to first old block position
+			{ uuid, startLine: 6, endLine: 9 } // close to second old block position
+		];
+
+		// All blocks have different content, so position should be the deciding factor
+		const oldLines = [
+			'@controlloomStart',
+			'old block A content',
+			'@controlloomEnd',
+			'',
+			'',
+			'@controlloomStart',
+			'old block B content',
+			'@controlloomEnd'
+		];
+
+		const newLines = [
+			'',
+			'@controlloomStart',
+			'new block A content',
+			'@controlloomEnd',
+			'',
+			'',
+			'@controlloomStart',
+			'new block B content',
+			'@controlloomEnd'
+		];
+
+		const pairings = findOptimalPairings(oldBlocks, newBlocks, oldLines, newLines);
+
+		expect(pairings).toHaveLength(2);
+
+		// Should pair based on position since no content matches
+		const pairing1 = pairings.find((p) => p.oldBlock.startLine === 0);
+		const pairing2 = pairings.find((p) => p.oldBlock.startLine === 5);
+
+		expect(pairing1).toBeDefined();
+		expect(pairing2).toBeDefined();
+
+		// First old block (line 0) should pair with first new block (line 1) - closest position
+		expect(pairing1!.newBlock.startLine).toBe(1);
+
+		// Second old block (line 5) should pair with second new block (line 6) - closest position
+		expect(pairing2!.newBlock.startLine).toBe(6);
+	});
+
+	it('should prioritize content similarity over positional proximity (80/20 weighting)', () => {
+		const oldBlocks = [
+			{ uuid, startLine: 0, endLine: 3 }, // block A
+			{ uuid, startLine: 5, endLine: 8 } // block B
+		];
+		const newBlocks = [
+			{ uuid, startLine: 100, endLine: 103 }, // block B content but far from original position
+			{ uuid, startLine: 2, endLine: 5 } // block A content close to original position
+		];
+
+		const oldLines = [
+			'@controlloomStart',
+			'block A content',
+			'@controlloomEnd',
+			'',
+			'',
+			'@controlloomStart',
+			'block B content',
+			'@controlloomEnd'
+		];
+
+		// New blocks: B content is far away (line 100), A content is close (line 2)
+		const newLines = Array(105)
+			.fill('')
+			.map((_, i) => {
+				if (i === 2) return '@controlloomStart';
+				if (i === 3) return 'block A content';
+				if (i === 4) return '@controlloomEnd';
+				if (i === 100) return '@controlloomStart';
+				if (i === 101) return 'block B content';
+				if (i === 102) return '@controlloomEnd';
+				return `line ${i}`;
+			});
+
+		const pairings = findOptimalPairings(oldBlocks, newBlocks, oldLines, newLines);
+
+		expect(pairings).toHaveLength(2);
+
+		const pairingA = pairings.find((p) => p.oldBlock.startLine === 0); // old block A
+		const pairingB = pairings.find((p) => p.oldBlock.startLine === 5); // old block B
+
+		expect(pairingA).toBeDefined();
+		expect(pairingB).toBeDefined();
+
+		// Content similarity should win: A pairs with A (line 2), B pairs with B (line 100)
+		// Even though B is far from its original position, content match is prioritized
+		expect(pairingA!.newBlock.startLine).toBe(2); // A content
+		expect(pairingB!.newBlock.startLine).toBe(100); // B content
+	});
+
+	it('should handle single block pairing', () => {
+		const oldBlocks = [{ uuid, startLine: 0, endLine: 3 }];
+		const newBlocks = [{ uuid, startLine: 5, endLine: 8 }];
+
+		const oldLines = ['@controlloomStart', 'content', '@controlloomEnd'];
+		const newLines = ['', '', '', '', '', '@controlloomStart', 'content', '@controlloomEnd'];
+
+		const pairings = findOptimalPairings(oldBlocks, newBlocks, oldLines, newLines);
+
+		expect(pairings).toHaveLength(1);
+		expect(pairings[0].oldBlock).toBe(oldBlocks[0]);
+		expect(pairings[0].newBlock).toBe(newBlocks[0]);
+	});
+
+	it('should handle empty input gracefully', () => {
+		const pairings = findOptimalPairings([], [], [], []);
+		expect(pairings).toHaveLength(0);
+	});
+
+	it('should ensure 1:1 pairing with no block used twice', () => {
+		const oldBlocks = [
+			{ uuid, startLine: 0, endLine: 3 },
+			{ uuid, startLine: 5, endLine: 8 },
+			{ uuid, startLine: 10, endLine: 13 }
+		];
+		const newBlocks = [
+			{ uuid, startLine: 20, endLine: 23 },
+			{ uuid, startLine: 25, endLine: 28 },
+			{ uuid, startLine: 30, endLine: 33 }
+		];
+
+		// Different content in all blocks to test position-based pairing
+		const oldLines = [
+			'@controlloomStart',
+			'old A',
+			'@controlloomEnd',
+			'',
+			'',
+			'@controlloomStart',
+			'old B',
+			'@controlloomEnd',
+			'',
+			'',
+			'@controlloomStart',
+			'old C',
+			'@controlloomEnd'
+		];
+		const newLines = Array(35)
+			.fill('')
+			.map((_, i) => {
+				if (i === 20) return '@controlloomStart';
+				if (i === 21) return 'new A';
+				if (i === 22) return '@controlloomEnd';
+				if (i === 25) return '@controlloomStart';
+				if (i === 26) return 'new B';
+				if (i === 27) return '@controlloomEnd';
+				if (i === 30) return '@controlloomStart';
+				if (i === 31) return 'new C';
+				if (i === 32) return '@controlloomEnd';
+				return `line ${i}`;
+			});
+
+		const pairings = findOptimalPairings(oldBlocks, newBlocks, oldLines, newLines);
+
+		expect(pairings).toHaveLength(3);
+
+		// Check that each old block and new block is used exactly once
+		const usedOldBlocks = pairings.map((p) => p.oldBlock);
+		const usedNewBlocks = pairings.map((p) => p.newBlock);
+
+		expect(new Set(usedOldBlocks)).toHaveProperty('size', 3);
+		expect(new Set(usedNewBlocks)).toHaveProperty('size', 3);
+
+		// Each original block should be represented
+		expect(usedOldBlocks).toContain(oldBlocks[0]);
+		expect(usedOldBlocks).toContain(oldBlocks[1]);
+		expect(usedOldBlocks).toContain(oldBlocks[2]);
+
+		// Each new block should be represented
+		expect(usedNewBlocks).toContain(newBlocks[0]);
+		expect(usedNewBlocks).toContain(newBlocks[1]);
+		expect(usedNewBlocks).toContain(newBlocks[2]);
+	});
+});
+
+describe('getChangedBlocks - unequal count scenarios', () => {
+	it('should not report the same new block multiple times when multiple old blocks are missing matches', () => {
+		const uuid = '123e4567-e89b-12d3-a456-426614174000';
+
+		// Old: 3 blocks with same UUID, all different content
+		const oldText = [
+			'header',
+			`// @controlloomStart ${uuid}`,
+			'old block A content',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'old block B content',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'old block C content',
+			`// @controlloomEnd ${uuid}`,
+			'footer'
+		].join('\n');
+
+		// New: Only 1 block with same UUID, different content
+		const newText = [
+			'header',
+			'',
+			'',
+			'',
+			'',
+			`// @controlloomStart ${uuid}`,
+			'new block content',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			'',
+			'',
+			'',
+			'footer'
+		].join('\n');
+
+		const changedBlocks = getChangedBlocks(oldText, newText);
+
+		// Should only report the single new block once, not three times
+		expect(changedBlocks).toHaveLength(1);
+		expect(changedBlocks[0].uuid).toBe(uuid);
+		expect(changedBlocks[0].startLine).toBe(5);
+		expect(changedBlocks[0].endLine).toBe(8);
+	});
+
+	it('should correctly pair exact matches first, then assign remaining blocks by proximity', () => {
+		const uuid = '123e4567-e89b-12d3-a456-426614174000';
+
+		// Old: 3 blocks - A, B, C
+		const oldText = [
+			'header',
+			`// @controlloomStart ${uuid}`,
+			'block A content',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'block B content',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'block C content',
+			`// @controlloomEnd ${uuid}`,
+			'footer'
+		].join('\n');
+
+		// New: 2 blocks - B (exact match) at line 20, and X (modified A) at line 2
+		const newText = [
+			'header',
+			`// @controlloomStart ${uuid}`,
+			'modified A content', // This should be paired with old A (closest position)
+			`// @controlloomEnd ${uuid}`,
+			...Array(15).fill(''),
+			`// @controlloomStart ${uuid}`,
+			'block B content', // This should be exact match with old B
+			`// @controlloomEnd ${uuid}`,
+			'footer'
+		].join('\n');
+
+		const changedBlocks = getChangedBlocks(oldText, newText);
+
+		// Should report 1 change: the modified A content (B is exact match, C is removed)
+		expect(changedBlocks).toHaveLength(1);
+		expect(changedBlocks[0].uuid).toBe(uuid);
+		expect(changedBlocks[0].startLine).toBe(1); // The modified A block position
+		expect(changedBlocks[0].endLine).toBe(4);
+	});
+
+	it('should handle case where new blocks are added and old blocks are modified', () => {
+		const uuid = '123e4567-e89b-12d3-a456-426614174000';
+
+		// Old: 2 blocks
+		const oldText = [
+			'header',
+			`// @controlloomStart ${uuid}`,
+			'old block 1 content',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'old block 2 content',
+			`// @controlloomEnd ${uuid}`,
+			'footer'
+		].join('\n');
+
+		// New: 3 blocks - 2 modified + 1 new
+		const newText = [
+			'header',
+			`// @controlloomStart ${uuid}`,
+			'modified block 1 content',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'modified block 2 content',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'brand new block content',
+			`// @controlloomEnd ${uuid}`,
+			'footer'
+		].join('\n');
+
+		const changedBlocks = getChangedBlocks(oldText, newText);
+
+		// Should report 2 changes (the 2 modified blocks, not the new one)
+		expect(changedBlocks).toHaveLength(2);
+
+		const changedPositions = changedBlocks.map((b) => b.startLine).sort();
+		expect(changedPositions).toEqual([1, 5]); // The two modified block positions
+	});
+
+	it('should not assign the same new block to multiple old blocks via filtering logic', () => {
+		const uuid = '123e4567-e89b-12d3-a456-426614174000';
+
+		// Edge case: Old blocks with no exact matches, but filtering could incorrectly exclude valid candidates
+		const oldText = [
+			`// @controlloomStart ${uuid}`,
+			'content A',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'content B',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'content C',
+			`// @controlloomEnd ${uuid}`
+		].join('\n');
+
+		// New: 2 blocks with different content than old
+		const newText = [
+			`// @controlloomStart ${uuid}`,
+			'new content X',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			'',
+			'',
+			'',
+			'',
+			`// @controlloomStart ${uuid}`,
+			'new content Y',
+			`// @controlloomEnd ${uuid}`
+		].join('\n');
+
+		const changedBlocks = getChangedBlocks(oldText, newText);
+
+		// Should report 2 changes maximum (can't report more new blocks than exist)
+		expect(changedBlocks.length).toBeLessThanOrEqual(2);
+
+		// No duplicate blocks should be reported
+		const uniqueBlocks = new Set(changedBlocks.map((b) => `${b.startLine}-${b.endLine}`));
+		expect(uniqueBlocks.size).toBe(changedBlocks.length);
+	});
+
+	it('should handle multiple old blocks removed scenario (3 old, 1 new)', () => {
+		const uuid = '123e4567-e89b-12d3-a456-426614174000';
+
+		// Old: 3 blocks with different content
+		const oldText = [
+			'header',
+			`// @controlloomStart ${uuid}`,
+			'original block 1 content',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'original block 2 content',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'original block 3 content',
+			`// @controlloomEnd ${uuid}`,
+			'footer'
+		].join('\n');
+
+		// New: 1 block with completely different content
+		const newText = [
+			'header',
+			'',
+			'',
+			'',
+			'',
+			`// @controlloomStart ${uuid}`,
+			'consolidated new content',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			'',
+			'',
+			'',
+			'footer'
+		].join('\n');
+
+		const changedBlocks = getChangedBlocks(oldText, newText);
+
+		// Should report 1 change (the new consolidated block)
+		expect(changedBlocks).toHaveLength(1);
+		expect(changedBlocks[0].uuid).toBe(uuid);
+		expect(changedBlocks[0].startLine).toBe(5);
+		expect(changedBlocks[0].endLine).toBe(8);
+	});
+
+	it('should handle multiple modified blocks with same UUID (2 old, 2 new, both modified)', () => {
+		const uuid = '123e4567-e89b-12d3-a456-426614174000';
+
+		// Old: 2 blocks with original content
+		const oldText = [
+			'header',
+			`// @controlloomStart ${uuid}`,
+			'original content A',
+			`// @controlloomEnd ${uuid}`,
+			'middle',
+			`// @controlloomStart ${uuid}`,
+			'original content B',
+			`// @controlloomEnd ${uuid}`,
+			'footer'
+		].join('\n');
+
+		// New: 2 blocks with modified content
+		const newText = [
+			'header',
+			`// @controlloomStart ${uuid}`,
+			'modified content A',
+			`// @controlloomEnd ${uuid}`,
+			'middle',
+			`// @controlloomStart ${uuid}`,
+			'modified content B',
+			`// @controlloomEnd ${uuid}`,
+			'footer'
+		].join('\n');
+
+		const changedBlocks = getChangedBlocks(oldText, newText);
+
+		// Should report 2 changes (both blocks were modified)
+		expect(changedBlocks).toHaveLength(2);
+		expect(changedBlocks[0].uuid).toBe(uuid);
+		expect(changedBlocks[1].uuid).toBe(uuid);
+
+		// Verify both blocks are reported
+		const positions = changedBlocks.map((b) => b.startLine).sort();
+		expect(positions).toEqual([1, 5]);
+	});
+
+	it('should handle all blocks with UUID modified (4 old → 4 new, all changed)', () => {
+		const uuid = '123e4567-e89b-12d3-a456-426614174000';
+
+		// Old: 4 blocks with original content
+		const oldText = [
+			`// @controlloomStart ${uuid}`,
+			'block 1 original',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'block 2 original',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'block 3 original',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'block 4 original',
+			`// @controlloomEnd ${uuid}`
+		].join('\n');
+
+		// New: 4 blocks with all modified content
+		const newText = [
+			`// @controlloomStart ${uuid}`,
+			'block 1 MODIFIED',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'block 2 MODIFIED',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'block 3 MODIFIED',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'block 4 MODIFIED',
+			`// @controlloomEnd ${uuid}`
+		].join('\n');
+
+		const changedBlocks = getChangedBlocks(oldText, newText);
+
+		// Should report 4 changes (all blocks were modified)
+		expect(changedBlocks).toHaveLength(4);
+
+		// All should have same UUID
+		changedBlocks.forEach((block) => {
+			expect(block.uuid).toBe(uuid);
+		});
+
+		// Verify all positions are reported (sorted for consistent comparison)
+		const positions = changedBlocks.map((b) => b.startLine).sort((a, b) => a - b);
+		expect(positions).toEqual([0, 4, 8, 12]);
+	});
+
+	it('should handle mixed scenario: some exact matches, some modifications (3 old → 4 new)', () => {
+		const uuid = '123e4567-e89b-12d3-a456-426614174000';
+
+		// Old: 3 blocks - A, B, C
+		const oldText = [
+			`// @controlloomStart ${uuid}`,
+			'block A content',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'block B content',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'block C content',
+			`// @controlloomEnd ${uuid}`
+		].join('\n');
+
+		// New: 4 blocks - A (unchanged), B (modified), C (unchanged), D (new)
+		const newText = [
+			`// @controlloomStart ${uuid}`,
+			'block A content', // Exact match - should not be reported
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'block B MODIFIED content', // Modified - should be reported
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'block C content', // Exact match - should not be reported
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'block D new content', // New block - should not be reported (no old match)
+			`// @controlloomEnd ${uuid}`
+		].join('\n');
+
+		const changedBlocks = getChangedBlocks(oldText, newText);
+
+		// Should report 1 change (only the modified B block)
+		expect(changedBlocks).toHaveLength(1);
+		expect(changedBlocks[0].uuid).toBe(uuid);
+		expect(changedBlocks[0].startLine).toBe(4); // Block B position
+		expect(changedBlocks[0].endLine).toBe(7);
+	});
+
+	it('should handle complex consolidation scenario (5 old → 2 new)', () => {
+		const uuid = '123e4567-e89b-12d3-a456-426614174000';
+
+		// Old: 5 blocks with different content
+		const oldText = [
+			`// @controlloomStart ${uuid}`,
+			'old block alpha',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'old block beta',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'old block gamma',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'old block delta',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'old block epsilon',
+			`// @controlloomEnd ${uuid}`
+		].join('\n');
+
+		// New: 2 blocks with new consolidated content
+		const newText = [
+			`// @controlloomStart ${uuid}`,
+			'consolidated block 1',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			'',
+			'',
+			'',
+			'',
+			'',
+			'',
+			'',
+			'',
+			'',
+			'',
+			'',
+			'',
+			`// @controlloomStart ${uuid}`,
+			'consolidated block 2',
+			`// @controlloomEnd ${uuid}`
+		].join('\n');
+
+		const changedBlocks = getChangedBlocks(oldText, newText);
+
+		// Should report 2 changes (both new consolidated blocks)
+		expect(changedBlocks).toHaveLength(2);
+		expect(changedBlocks[0].uuid).toBe(uuid);
+		expect(changedBlocks[1].uuid).toBe(uuid);
+
+		// Should not report more blocks than actually exist in new version
+		const positions = changedBlocks.map((b) => b.startLine).sort();
+		expect(positions).toEqual([0, 16]);
+	});
+
+	it('should prioritize exact matches in unequal count scenarios', () => {
+		const uuid = '123e4567-e89b-12d3-a456-426614174000';
+
+		// Old: 4 blocks with specific content
+		const oldText = [
+			`// @controlloomStart ${uuid}`,
+			'unique content 1',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'shared content',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'unique content 3',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			`// @controlloomStart ${uuid}`,
+			'unique content 4',
+			`// @controlloomEnd ${uuid}`
+		].join('\n');
+
+		// New: 2 blocks - one exact match, one new
+		const newText = [
+			`// @controlloomStart ${uuid}`,
+			'brand new content',
+			`// @controlloomEnd ${uuid}`,
+			'',
+			'',
+			'',
+			'',
+			'',
+			`// @controlloomStart ${uuid}`,
+			'shared content', // This should match exactly with old block 2
+			`// @controlloomEnd ${uuid}`
+		].join('\n');
+
+		const changedBlocks = getChangedBlocks(oldText, newText);
+
+		// Should report 1 change (the brand new content block)
+		// The 'shared content' block should be recognized as exact match and not reported
+		expect(changedBlocks).toHaveLength(1);
+		expect(changedBlocks[0].startLine).toBe(0);
+		expect(changedBlocks[0].endLine).toBe(3);
+	});
+});
+
+describe('getRemovedBlocks', () => {
+	it('detects blocks that exist in old text but not in new text', () => {
+		const uuid1 = '123e4567-e89b-12d3-a456-426614174000';
+		const uuid2 = '987fcdeb-51a2-43d1-b789-456789012345';
+
+		const oldText = [
+			'header',
+			`// @controlloomStart ${uuid1}`,
+			'old content 1',
+			`// @controlloomEnd ${uuid1}`,
+			'middle',
+			`// @controlloomStart ${uuid2}`,
+			'old content 2',
+			`// @controlloomEnd ${uuid2}`,
+			'footer'
+		].join('\n');
+
+		const newText = [
+			'header',
+			`// @controlloomStart ${uuid1}`,
+			'new content 1',
+			`// @controlloomEnd ${uuid1}`,
+			'middle',
+			'footer'
+		].join('\n');
+
+		const removed = getRemovedBlocks(oldText, newText);
+		expect(removed).toHaveLength(1);
+		expect(removed[0].uuid).toBe(uuid2);
+		expect(removed[0].startLine).toBe(5);
+		expect(removed[0].endLine).toBe(8);
+	});
+
+	it('returns empty array when no blocks are removed', () => {
+		const uuid = '123e4567-e89b-12d3-a456-426614174000';
+
+		const oldText = [
+			'header',
+			`// @controlloomStart ${uuid}`,
+			'old content',
+			`// @controlloomEnd ${uuid}`,
+			'footer'
+		].join('\n');
+
+		const newText = [
+			'header',
+			`// @controlloomStart ${uuid}`,
+			'new content',
+			`// @controlloomEnd ${uuid}`,
+			'footer'
+		].join('\n');
+
+		const removed = getRemovedBlocks(oldText, newText);
+		expect(removed).toHaveLength(0);
+	});
+
+	it('detects all removed blocks when old text has annotations but new text has none', () => {
+		const uuid1 = '123e4567-e89b-12d3-a456-426614174000';
+		const uuid2 = '987fcdeb-51a2-43d1-b789-456789012345';
+
+		const oldText = [
+			'header',
+			`// @controlloomStart ${uuid1}`,
+			'content 1',
+			`// @controlloomEnd ${uuid1}`,
+			'middle',
+			`// @controlloomStart ${uuid2}`,
+			'content 2',
+			`// @controlloomEnd ${uuid2}`,
+			'footer'
+		].join('\n');
+
+		const newText = ['header', 'middle', 'footer'].join('\n');
+
+		const removed = getRemovedBlocks(oldText, newText);
+		expect(removed).toHaveLength(2);
+		expect(removed.map((b) => b.uuid)).toContain(uuid1);
+		expect(removed.map((b) => b.uuid)).toContain(uuid2);
+	});
+});
+
+describe('cleanup helpers', () => {
+	it('deleteOldIssueComments deletes only the first signed comment per page', async () => {
+		const octokit = new Octokit();
+		issuesListComments
+			.mockResolvedValueOnce({
+				data: [
+					{ id: 1, body: `${CONTROLLOOM_SIGNATURE}\nSigned A` },
+					{ id: 2, body: 'Not signed' },
+					{ id: 3, body: `${CONTROLLOOM_SIGNATURE}\nSigned B` }
+				]
+			})
+			.mockResolvedValueOnce({ data: [] });
+
+		await deleteOldIssueComments({ octokit, owner: 'o', repo: 'r', pull_number: 7 });
+
+		expect(issuesDeleteComment).toHaveBeenCalledTimes(1);
+		expect(issuesDeleteComment).toHaveBeenNthCalledWith(1, {
+			owner: 'o',
+			repo: 'r',
+			comment_id: 1
+		});
+	});
+
+	it('deleteOldReviewComments deletes only the first signed review comment per page', async () => {
+		const octokit = new Octokit();
+
+		pullsListReviewComments
+			.mockResolvedValueOnce({
+				data: [
+					{ id: 11, body: `${CONTROLLOOM_SIGNATURE}\nRC A` },
+					{ id: 12, body: 'other' },
+					{ id: 13, body: `${CONTROLLOOM_SIGNATURE}\nRC B` }
+				]
+			})
+			.mockResolvedValueOnce({ data: [] });
+
+		await deleteOldReviewComments({ octokit, owner: 'o', repo: 'r', pull_number: 8 });
+
+		expect(pullsDeleteReviewComment).toHaveBeenCalledTimes(1);
+		expect(pullsDeleteReviewComment).toHaveBeenNthCalledWith(1, {
+			owner: 'o',
+			repo: 'r',
+			comment_id: 11
+		});
+	});
+
+	it('dismissOldReviews dismisses only the first signed review per page (handles null bodies)', async () => {
+		const octokit = new Octokit();
+		pullsListReviews
+			.mockResolvedValueOnce({
+				data: [
+					{ id: 21, body: `${CONTROLLOOM_SIGNATURE}\nReview A` },
+					{ id: 22, body: null },
+					{ id: 23, body: 'not signed' },
+					{ id: 24, body: `${CONTROLLOOM_SIGNATURE}\nReview B` }
+				]
+			})
+			.mockResolvedValueOnce({ data: [] });
+
+		await dismissOldReviews({ octokit, owner: 'o', repo: 'r', pull_number: 9 });
+
+		expect(pullsDismissReview).toHaveBeenCalledTimes(1);
+		expect(pullsDismissReview).toHaveBeenNthCalledWith(1, {
+			owner: 'o',
+			repo: 'r',
+			pull_number: 9,
+			review_id: 21,
+			message: 'Superseded by a new ControlLoom compliance review.'
+		});
+	});
+});
+
+describe('cleanup helpers (null/undefined body edge cases)', () => {
+	it('deleteOldIssueComments skips when body is null (covers (c.body ?? ""))', async () => {
+		const octokit = new Octokit();
+		issuesListComments
+			.mockResolvedValueOnce({ data: [{ id: 1, body: null }] })
+			.mockResolvedValueOnce({ data: [] });
+
+		await deleteOldIssueComments({ octokit, owner: 'o', repo: 'r', pull_number: 10 });
+
+		expect(issuesDeleteComment).not.toHaveBeenCalled();
+	});
+
+	it('deleteOldReviewComments skips when body is undefined (covers (rc.body ?? ""))', async () => {
+		const octokit = new Octokit();
+		pullsListReviewComments
+			.mockResolvedValueOnce({ data: [{ id: 2, body: undefined }] })
+			.mockResolvedValueOnce({ data: [] });
+
+		await deleteOldReviewComments({ octokit, owner: 'o', repo: 'r', pull_number: 11 });
+
+		expect(pullsDeleteReviewComment).not.toHaveBeenCalled();
+	});
+
+	it('dismissOldReviews skips when body is null (covers (r.body ?? ""))', async () => {
+		const octokit = new Octokit();
+		pullsListReviews
+			.mockResolvedValueOnce({ data: [{ id: 3, body: null }] })
+			.mockResolvedValueOnce({ data: [] });
+
+		await dismissOldReviews({ octokit, owner: 'o', repo: 'r', pull_number: 12 });
+
+		expect(pullsDismissReview).not.toHaveBeenCalled();
+	});
+});
+
+describe('crawl command (integration)', () => {
+	it('detects deleted files with ControlLoom annotations and adds warning', async () => {
+		const uuid = '123e4567-e89b-12d3-a456-426614174000';
+		process.env.OWNER = 'octo-org';
+		process.env.REPO = 'octo-repo';
+		process.env.PULL_NUMBER = '88';
+		process.env.GITHUB_TOKEN = 'fake-token';
+
+		pullsGet.mockResolvedValue({
+			data: { head: { ref: 'feature-branch', sha: 'head-sha-456' }, base: { sha: 'base-sha-456' } }
+		});
+
+		pullsListReviewComments.mockResolvedValue({ data: [] });
+		pullsListReviews.mockResolvedValue({ data: [] });
+		issuesListComments.mockResolvedValue({ data: [] });
+		pullsListFiles.mockResolvedValue({
+			data: [
+				{ filename: 'config/secrets.yaml', status: 'removed' },
+				{ filename: 'src/regular.txt', status: 'modified' }
+			]
+		});
+		const deletedFileContent = [
+			'# Configuration file with secrets',
+			`# @controlloomStart ${uuid}`,
+			'database:',
+			'  password: "secret123"',
+			'  host: "db.internal"',
+			`# @controlloomEnd ${uuid}`,
+			'# End of config'
+		].join('\n');
+
+		const regularFileOld = 'const x = 1;';
+		const regularFileNew = 'const x = 2;';
+
+		reposGetContent.mockImplementation(({ path, ref }) => {
+			if (path === 'config/secrets.yaml' && ref === 'base-sha-456') {
+				const content = Buffer.from(deletedFileContent, 'utf8').toString('base64');
+				return Promise.resolve({ data: { content } });
+			}
+			if (path === 'src/regular.txt' && ref === 'base-sha-456') {
+				const content = Buffer.from(regularFileOld, 'utf8').toString('base64');
+				return Promise.resolve({ data: { content } });
+			}
+			if (path === 'src/regular.txt' && ref === 'head-sha-456') {
+				const content = Buffer.from(regularFileNew, 'utf8').toString('base64');
+				return Promise.resolve({ data: { content } });
+			}
+			throw new Error(`Unexpected getContent call for ${path} @ ${ref}`);
+		});
+
+		const command = crawlCommand();
+		await command.parseAsync(['--post-mode', 'review'], { from: 'user' });
+
+		expect(pullsCreateReview).toHaveBeenCalledTimes(1);
+
+		const call = pullsCreateReview.mock.calls[0][0];
+		expect(call.owner).toBe('octo-org');
+		expect(call.repo).toBe('octo-repo');
+		expect(call.pull_number).toBe(88);
+
+		expect(call.body).toContain('## ControlLoom Compliance Overview');
+		expect(call.body).toContain(
+			'**Compliance Warning: Files with ControlLoom annotations were deleted**'
+		);
+		expect(call.body).toContain('config/secrets.yaml');
+		expect(call.body).toContain('This may affect compliance coverage');
+		expect(call.body).toContain('Please review whether:');
+		expect(call.body).toContain('The compliance coverage provided by these files is still needed');
+		expect(call.body).toContain('Alternative compliance measures have been implemented');
+	});
+
+	it('comments only for changed blocks, cleans old comments, skips added files, and handles errors (comment mode)', async () => {
+		process.env.OWNER = 'octo-org';
+		process.env.REPO = 'octo-repo';
+		process.env.PULL_NUMBER = '77';
+		process.env.GITHUB_TOKEN = 'test-token';
+
+		pullsGet.mockResolvedValueOnce({
+			data: { head: { ref: 'feat', sha: 'feat-sha' }, base: { sha: 'base-sha-abc' } }
+		});
+		pullsListFiles.mockResolvedValueOnce({
+			data: [
+				{ filename: 'src/file1.txt', status: 'modified' },
+				{ filename: 'src/added.txt', status: 'added' },
+				{ filename: 'src/broken.txt', status: 'modified' }
+			]
+		});
+
+		const uuid = '123e4567-e89b-12d3-a456-426614174000';
+		const oldText = [
+			'header',
+			`// @controlloomStart ${uuid}`,
+			'old line',
+			`// @controlloomEnd ${uuid}`,
+			'footer'
+		].join('\n');
+
+		const newText = [
+			'header',
+			`// @controlloomStart ${uuid}`,
+			'new line changed',
+			`// @controlloomEnd ${uuid}`,
+			'footer'
+		].join('\n');
+
+		reposGetContent.mockImplementation(({ path, ref }) => {
+			if (path === 'src/file1.txt' && ref === 'base-sha-abc')
+				return Promise.resolve({ data: oldText });
+			if (path === 'src/file1.txt' && ref === 'feat-sha') {
+				const content = Buffer.from(newText, 'utf8').toString('base64');
+				return Promise.resolve({ data: { content } });
+			}
+			if (path === 'src/broken.txt') return Promise.reject(new Error('Fetch failed'));
+			throw new Error(`Unexpected getContent call for ${path} @ ${ref}`);
+		});
+
+		issuesListComments
+			.mockResolvedValueOnce({ data: [{ id: 99, body: `${CONTROLLOOM_SIGNATURE}\nold content` }] })
+			.mockResolvedValueOnce({ data: [] });
+
+		const command = crawlCommand();
+		await command.parseAsync(['--post-mode', 'comment'], { from: 'user' });
+
+		expect(issuesDeleteComment).toHaveBeenCalledTimes(1);
+		expect(issuesDeleteComment).toHaveBeenCalledWith({
+			owner: 'octo-org',
+			repo: 'octo-repo',
+			comment_id: 99
+		});
+
+		expect(issuesCreateComment).toHaveBeenCalledTimes(1);
+		expect(pullsCreateReview).not.toHaveBeenCalled();
+
+		const call = issuesCreateComment.mock.calls[0][0];
+		expect(call.owner).toBe('octo-org');
+		expect(call.repo).toBe('octo-repo');
+		expect(call.issue_number).toBe(77);
+
+		expect(call.body).toContain('## ControlLoom Compliance Overview');
+		expect(call.body).toContain('src/file1.txt');
+
+		expect(call.body).toMatch(/`2–4`/);
+
+		const changedBlockText = [
+			`// @controlloomStart ${uuid}`,
+			'new line changed',
+			`// @controlloomEnd ${uuid}`
+		].join('\n');
+		const expectedSha = crypto.createHash('sha256').update(changedBlockText).digest('hex');
+		expect(call.body).toContain(uuid);
+		expect(call.body).toContain(expectedSha);
+
+		const fetchedPaths = reposGetContent.mock.calls.map((c) => c[0].path);
+		expect(fetchedPaths).not.toContain('src/added.txt');
+	});
+
+	it('review mode: cleans old reviews & review comments, then posts REQUEST_CHANGES', async () => {
+		process.env.OWNER = 'octo-org';
+		process.env.REPO = 'octo-repo';
+		process.env.PULL_NUMBER = '88';
+		process.env.GITHUB_TOKEN = 'test-token';
+
+		pullsGet.mockResolvedValueOnce({
+			data: { head: { ref: 'feat', sha: 'feat-sha' }, base: { sha: 'base-sha-abc' } }
+		});
+		pullsListFiles.mockResolvedValueOnce({ data: [{ filename: 'x.txt', status: 'modified' }] });
+
+		const uuid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+		const oldText = [
+			'a',
+			`// @controlloomStart ${uuid}`,
+			'old',
+			`// @controlloomEnd ${uuid}`,
+			'z'
+		].join('\n');
+		const newText = [
+			'a',
+			`// @controlloomStart ${uuid}`,
+			'new',
+			`// @controlloomEnd ${uuid}`,
+			'z'
+		].join('\n');
+
+		reposGetContent.mockImplementation(({ path, ref }) => {
+			if (path === 'x.txt' && ref === 'base-sha-abc') return Promise.resolve({ data: oldText });
+			if (path === 'x.txt' && ref === 'feat-sha') {
+				const content = Buffer.from(newText, 'utf8').toString('base64');
+				return Promise.resolve({ data: { content } });
+			}
+			throw new Error('unexpected getContent');
+		});
+
+		pullsListReviewComments
+			.mockResolvedValueOnce({
+				data: [{ id: 55, body: '<!-- CONTROLLOOM_SIGNATURE:v1 -->\nline cmt' }]
+			})
+			.mockResolvedValueOnce({ data: [] }); // end pages
+
+		pullsListReviews
+			.mockResolvedValueOnce({
+				data: [{ id: 66, body: '<!-- CONTROLLOOM_SIGNATURE:v1 -->\nreview' }]
+			})
+			.mockResolvedValueOnce({ data: [] });
+
+		const command = crawlCommand();
+		await command.parseAsync(['--post-mode', 'review'], { from: 'user' });
+
+		expect(pullsListReviewComments).toHaveBeenCalled();
+		expect(pullsListReviews).toHaveBeenCalled();
+
+		expect(pullsDeleteReviewComment).toHaveBeenCalledTimes(1);
+		expect(pullsDeleteReviewComment).toHaveBeenCalledWith({
+			owner: 'octo-org',
+			repo: 'octo-repo',
+			comment_id: 55
+		});
+
+		expect(pullsDismissReview).toHaveBeenCalledTimes(1);
+		expect(pullsDismissReview).toHaveBeenCalledWith({
+			owner: 'octo-org',
+			repo: 'octo-repo',
+			pull_number: 88,
+			review_id: 66,
+			message: 'Superseded by a new ControlLoom compliance review.'
+		});
+
+		expect(pullsCreateReview).toHaveBeenCalledTimes(1);
+		expect(issuesCreateComment).not.toHaveBeenCalled();
+	});
+
+	it('no changes found: runs cleanup but does not post anything', async () => {
+		process.env.OWNER = 'o';
+		process.env.REPO = 'r';
+		process.env.PULL_NUMBER = '99';
+		process.env.GITHUB_TOKEN = 'x';
+
+		pullsGet.mockResolvedValueOnce({
+			data: { head: { ref: 'same', sha: 'same-sha' }, base: { sha: 'base-sha-def' } }
+		});
+		pullsListFiles.mockResolvedValueOnce({ data: [{ filename: 'same.txt', status: 'modified' }] });
+
+		const txt = [
+			'h',
+			'// @controlloomStart 11111111-1111-1111-1111-111111111111',
+			'x',
+			'// @controlloomEnd 11111111-1111-1111-1111-111111111111',
+			'f'
+		].join('\n');
+
+		reposGetContent.mockImplementation(({ path }) => {
+			if (path === 'same.txt') return Promise.resolve({ data: txt });
+			throw new Error('unexpected');
+		});
+
+		issuesListComments.mockResolvedValueOnce({ data: [] });
+		pullsListReviewComments.mockResolvedValueOnce({ data: [] });
+		pullsListReviews.mockResolvedValueOnce({ data: [] });
+
+		const command = crawlCommand();
+		await command.parseAsync(['--post-mode', 'comment'], { from: 'user' });
+
+		expect(issuesDeleteComment).not.toHaveBeenCalled();
+		expect(pullsDeleteReviewComment).not.toHaveBeenCalled();
+		expect(pullsDismissReview).not.toHaveBeenCalled();
+
+		expect(issuesCreateComment).not.toHaveBeenCalled();
+		expect(pullsCreateReview).not.toHaveBeenCalled();
+	});
+});
+
+describe('postFinding', () => {
+	it('creates a PR review with REQUEST_CHANGES when postMode is "review"', async () => {
+		const octokit = new Octokit();
+
+		await postFinding({
+			octokit,
+			postMode: 'review',
+			owner: 'octo-org',
+			repo: 'octo-repo',
+			pull_number: 101,
+			body: 'Review body'
+		});
+
+		expect(mockOctokitInstance.pulls.createReview).toHaveBeenCalledTimes(1);
+		expect(mockOctokitInstance.pulls.createReview).toHaveBeenCalledWith({
+			owner: 'octo-org',
+			repo: 'octo-repo',
+			pull_number: 101,
+			body: 'Review body',
+			event: 'REQUEST_CHANGES'
+		});
+
+		expect(mockOctokitInstance.issues.createComment).not.toHaveBeenCalled();
+	});
+
+	it('creates an issue comment when postMode is "comment"', async () => {
+		const octokit = new Octokit();
+
+		await postFinding({
+			octokit,
+			postMode: 'comment',
+			owner: 'octo-org',
+			repo: 'octo-repo',
+			pull_number: 202,
+			body: 'Comment body'
+		});
+
+		expect(mockOctokitInstance.issues.createComment).toHaveBeenCalledTimes(1);
+		expect(mockOctokitInstance.issues.createComment).toHaveBeenCalledWith({
+			owner: 'octo-org',
+			repo: 'octo-repo',
+			issue_number: 202,
+			body: 'Comment body'
+		});
+
+		expect(mockOctokitInstance.pulls.createReview).not.toHaveBeenCalled();
+	});
+});
+
+describe('containsControlLoomAnnotations', () => {
+	it('returns true when text contains @controlloomStart', () => {
+		const text = `
+      Some code here
+      // @controlloomStart 123e4567-e89b-12d3-a456-426614174000
+      const config = { secret: true };
+    `;
+		expect(containsControlLoomAnnotations(text)).toBe(true);
+	});
+
+	it('returns true when text contains @controlloomEnd', () => {
+		const text = `
+      const config = { secret: true };
+      // @controlloomEnd 123e4567-e89b-12d3-a456-426614174000
+      Some other code here
+    `;
+		expect(containsControlLoomAnnotations(text)).toBe(true);
+	});
+
+	it('returns true when text contains both @controlloomStart and @controlloomEnd', () => {
+		const text = `
+      Some code here
+      // @controlloomStart 123e4567-e89b-12d3-a456-426614174000
+      const config = { secret: true };
+      // @controlloomEnd 123e4567-e89b-12d3-a456-426614174000
+      Some other code here
+    `;
+		expect(containsControlLoomAnnotations(text)).toBe(true);
+	});
+
+	it('returns false when text contains no ControlLoom annotations', () => {
+		const text = `
+      Some regular code here
+      const config = { public: true };
+      // Just regular comments
+    `;
+		expect(containsControlLoomAnnotations(text)).toBe(false);
+	});
+
+	it('returns false for empty text', () => {
+		expect(containsControlLoomAnnotations('')).toBe(false);
+	});
+
+	it('returns true when annotations are in different formats', () => {
+		const text1 = `# @controlloomStart abc123`;
+		const text2 = `<!-- @controlloomEnd def456 -->`;
+		const text3 = `/* @controlloomStart ghi789 */`;
+
+		expect(containsControlLoomAnnotations(text1)).toBe(true);
+		expect(containsControlLoomAnnotations(text2)).toBe(true);
+		expect(containsControlLoomAnnotations(text3)).toBe(true);
+	});
+});
+
+import {
+	createInitialCommentBody,
+	analyzeDeletedFiles,
+	generateChangedBlocksContent,
+	generateRemovedBlocksContent,
+	analyzeModifiedFiles,
+	performComplianceAnalysis,
+	cleanupOldPosts
+} from './crawl';
+import type { CrawlContext, PullRequestFile } from './crawl';
+
+function createTestFile(
+	filename: string,
+	status: PullRequestFile['status'] = 'modified'
+): PullRequestFile {
+	return {
+		sha: 'abc123',
+		filename,
+		status,
+		additions: 1,
+		deletions: 0,
+		changes: 1,
+		blob_url: `https://github.com/test/repo/blob/main/${filename}`,
+		raw_url: `https://github.com/test/repo/raw/main/${filename}`,
+		contents_url: `https://api.github.com/repos/test/repo/contents/${filename}`
+	};
+}
+
+describe('Refactored crawl functions', () => {
+	// Include baseSha/headSha so types and runtime calls are satisfied
+	const mockContext: CrawlContext = {
+		octokit: mockOctokitInstance as unknown as Octokit,
+		owner: 'testowner',
+		repo: 'testrepo',
+		pull_number: 123,
+		prBranch: 'feature-branch',
+		baseSha: 'base-sha-ctx',
+		headSha: 'head-sha-ctx',
+		files: []
+	};
+
+	beforeEach(() => {
+		vi.clearAllMocks();
+		logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+		errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+		stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true as any);
+	});
+
+	afterEach(() => {
+		logSpy?.mockRestore();
+		errSpy?.mockRestore();
+		stderrSpy?.mockRestore();
+	});
+
+	describe('createInitialCommentBody', () => {
+		it('should create initial comment body with correct format', () => {
+			const result = createInitialCommentBody(5);
+
+			expect(result).toContain(CONTROLLOOM_SIGNATURE);
+			expect(result).toContain('## ControlLoom Compliance Overview');
+			expect(result).toContain('ControlLoom reviewed 5 files changed');
+			expect(result).toContain('Please review the changes');
+		});
+
+		it('should handle zero files', () => {
+			const result = createInitialCommentBody(0);
+			expect(result).toContain('ControlLoom reviewed 0 files changed');
+		});
+
+		it('should handle single file', () => {
+			const result = createInitialCommentBody(1);
+			expect(result).toContain('ControlLoom reviewed 1 files changed');
+		});
+	});
+
+	describe('analyzeDeletedFiles', () => {
+		it('should return no findings when no files are deleted', async () => {
+			const context = {
+				...mockContext,
+				files: [createTestFile('test.js', 'modified'), createTestFile('new.js', 'added')]
+			};
+
+			const result = await analyzeDeletedFiles(context);
+
+			expect(result.hasFindings).toBe(false);
+			expect(result.warningContent).toBe('');
+		});
+
+		it('should return no findings when deleted files have no annotations', async () => {
+			const context = {
+				...mockContext,
+				files: [createTestFile('test.js', 'removed')]
+			};
+
+			reposGetContent.mockResolvedValue({
+				data: 'const x = 1;\nconsole.log(x);'
+			});
+
+			const result = await analyzeDeletedFiles(context);
+
+			expect(result.hasFindings).toBe(false);
+			expect(result.warningContent).toBe('');
+		});
+
+		it('should detect deleted files with ControlLoom annotations', async () => {
+			const context = {
+				...mockContext,
+				files: [createTestFile('annotated.js', 'removed'), createTestFile('clean.js', 'removed')]
+			};
+
+			reposGetContent
+				.mockResolvedValueOnce({
+					data: 'const x = 1;\n// @controlloomStart abc123\nconsole.log(x);\n// @controlloomEnd abc123'
+				})
+				.mockResolvedValueOnce({
+					data: 'const y = 2;\nconsole.log(y);'
+				});
+
+			const result = await analyzeDeletedFiles(context);
+
+			expect(result.hasFindings).toBe(true);
+			expect(result.warningContent).toContain('Files with ControlLoom annotations were deleted');
+			expect(result.warningContent).toContain('`annotated.js`');
+			expect(result.warningContent).not.toContain('`clean.js`');
+			expect(result.warningContent).toContain('compliance coverage provided by these files');
+		});
+
+		it('should handle API errors gracefully', async () => {
+			const context = {
+				...mockContext,
+				files: [createTestFile('error.js', 'removed')]
+			};
+
+			reposGetContent.mockRejectedValue(new Error('API Error'));
+
+			const result = await analyzeDeletedFiles(context);
+
+			expect(result.hasFindings).toBe(false);
+			expect(result.warningContent).toBe('');
+			expect(errSpy).toHaveBeenCalledWith('Error checking deleted file error.js: Error: API Error');
+		});
+	});
+
+	describe('generateChangedBlocksContent', () => {
+		it('should generate content for single changed block', () => {
+			const changedBlocks = [{ uuid: 'abc123', startLine: 5, endLine: 10 }];
+			const newText =
+				'line1\nline2\nline3\nline4\nline5\nchanged content\nline7\nline8\nline9\nline10\nline11';
+
+			const result = generateChangedBlocksContent('test.js', changedBlocks, newText);
+
+			expect(result).toContain('| File | Lines Changed |');
+			expect(result).toContain('| `test.js` | `6–10` |');
+			expect(result).toContain('**UUID:** `abc123`');
+			expect(result).toContain('**sha256:**');
+			expect(logSpy).toHaveBeenCalledWith('Commenting regarding `test.js`.');
+		});
+
+		it('should generate content for multiple changed blocks with consolidated table', () => {
+			const changedBlocks = [
+				{ uuid: 'abc123', startLine: 0, endLine: 2 },
+				{ uuid: 'def456', startLine: 5, endLine: 7 }
+			];
+			const newText = 'line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8';
+
+			const result = generateChangedBlocksContent('test.js', changedBlocks, newText);
+
+			// Should have one table header
+			const tableHeaderMatches = result.match(/\| File \| Lines Changed \|/g);
+			expect(tableHeaderMatches).toHaveLength(1);
+
+			// Should contain both rows in the same table
+			expect(result).toContain('| `test.js` | `1–2` |');
+			expect(result).toContain('| `test.js` | `6–7` |');
+
+			// Should have separate block and sha256 entries after the table
+			expect(result).toContain('**UUID:** `abc123`');
+			expect(result).toContain('**UUID:** `def456`');
+			expect(result).toContain('**sha256:**');
+
+			// Should only log once per call to the function
+			expect(logSpy).toHaveBeenCalledWith('Commenting regarding `test.js`.');
+		});
+
+		it('should return empty string for no changed blocks', () => {
+			const result = generateChangedBlocksContent('test.js', [], 'some text');
+			expect(result).toBe('');
+		});
+	});
+
+	describe('generateRemovedBlocksContent', () => {
+		it('should return empty string for no removed blocks', () => {
+			const result = generateRemovedBlocksContent('test.js', [], 'some text');
+			expect(result).toBe('');
+		});
+
+		it('should generate content for removed blocks with consolidated table', () => {
+			const removedBlocks = [
+				{ uuid: 'abc123', startLine: 0, endLine: 3 },
+				{ uuid: 'def456', startLine: 5, endLine: 8 }
+			];
+			const oldText = 'line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9';
+
+			const result = generateRemovedBlocksContent('test.js', removedBlocks, oldText);
+
+			expect(result).toContain('ControlLoom annotations were removed from `test.js`');
+
+			// Should have one table header
+			const tableHeaderMatches = result.match(/\| File \| Original Lines \| UUID \|/g);
+			expect(tableHeaderMatches).toHaveLength(1);
+
+			// Should contain both rows in the same table
+			expect(result).toContain('| `test.js` | `1–3` | `abc123` |');
+			expect(result).toContain('| `test.js` | `6–8` | `def456` |');
+
+			// Should have separate block and sha256 entries after the table
+			expect(result).toContain('**UUID:** `abc123`');
+			expect(result).toContain('**UUID:** `def456`');
+			expect(result).toContain('**sha256:**');
+
+			expect(result).toContain('removal of these compliance annotations is intentional');
+			expect(logSpy).toHaveBeenCalledWith('Found removed annotations in `test.js`.');
+		});
+
+		it('should generate proper warning text', () => {
+			const removedBlocks = [{ uuid: 'abc123', startLine: 0, endLine: 2 }];
+			const oldText = 'line1\nline2';
+
+			const result = generateRemovedBlocksContent('test.js', removedBlocks, oldText);
+
+			expect(result).toContain('Please review whether:');
+			expect(result).toContain('- The removal of these compliance annotations is intentional');
+			expect(result).toContain('- Alternative compliance measures have been implemented');
+			expect(result).toContain('- The compliance coverage is still adequate');
+		});
+	});
+
+	describe('analyzeModifiedFiles', () => {
+		it('should return no findings for no modified files', async () => {
+			const context = {
+				...mockContext,
+				files: [createTestFile('new.js', 'added'), createTestFile('old.js', 'removed')]
+			};
+
+			const result = await analyzeModifiedFiles(context);
+
+			expect(result.hasFindings).toBe(false);
+			expect(result.changesContent).toBe('');
+		});
+
+		it('should analyze modified files with changes', async () => {
+			const context = {
+				...mockContext,
+				files: [createTestFile('test.js', 'modified')]
+			};
+
+			const oldContent = `line1
+// @controlloomStart abc123
+old annotation content
+// @controlloomEnd abc123
+line5`;
+
+			const newContent = `line1
+// @controlloomStart abc123
+new changed content
+// @controlloomEnd abc123
+line5`;
+
+			reposGetContent
+				.mockResolvedValueOnce({ data: oldContent })
+				.mockResolvedValueOnce({ data: newContent });
+
+			const result = await analyzeModifiedFiles(context);
+
+			expect(result.hasFindings).toBe(true);
+			expect(result.changesContent).toContain('| File | Lines Changed |');
+		});
+
+		it('should analyze modified files with removed blocks', async () => {
+			const context = {
+				...mockContext,
+				files: [createTestFile('test.js', 'modified')]
+			};
+
+			const oldContent = `line1
+// @controlloomStart abc123
+annotation content that will be removed
+// @controlloomEnd abc123
+line5`;
+
+			const newContent = `line1
+line5`;
+
+			reposGetContent
+				.mockResolvedValueOnce({ data: oldContent })
+				.mockResolvedValueOnce({ data: newContent });
+
+			const result = await analyzeModifiedFiles(context);
+
+			expect(result.hasFindings).toBe(true);
+			expect(result.changesContent).toContain(
+				'ControlLoom annotations were removed from `test.js`'
+			);
+			expect(result.changesContent).toContain('| File | Original Lines | UUID |');
+		});
+
+		it('should handle API errors gracefully', async () => {
+			const context = {
+				...mockContext,
+				files: [createTestFile('error.js', 'modified')]
+			};
+
+			reposGetContent.mockRejectedValue(new Error('API Error'));
+
+			const result = await analyzeModifiedFiles(context);
+
+			expect(result.hasFindings).toBe(false);
+			expect(result.changesContent).toBe('');
+			expect(errSpy).toHaveBeenCalledWith('Error processing error.js: Error: API Error');
+		});
+	});
+
+	describe('performComplianceAnalysis', () => {
+		it('should combine results from deleted and modified file analysis', async () => {
+			const context = {
+				...mockContext,
+				files: [createTestFile('deleted.js', 'removed'), createTestFile('modified.js', 'modified')]
+			};
+
+			reposGetContent.mockImplementation((params: { path: string }) => {
+				if (params.path === 'deleted.js') {
+					return Promise.resolve({
+						data: '// @controlloomStart abc\ncontent\n// @controlloomEnd abc'
+					});
+				}
+				return Promise.resolve({ data: 'normal content' });
+			});
+
+			const result = await performComplianceAnalysis(context);
+
+			expect(result.hasFindings).toBe(true);
+			expect(result.commentBody).toContain(CONTROLLOOM_SIGNATURE);
+			expect(result.commentBody).toContain('ControlLoom reviewed 2 files changed');
+			expect(result.commentBody).toContain('Files with ControlLoom annotations were deleted');
+		});
+
+		it('should return no findings when no compliance issues found', async () => {
+			const context = {
+				...mockContext,
+				files: [createTestFile('clean.js', 'modified')]
+			};
+
+			reposGetContent.mockResolvedValue({ data: 'clean content' });
+
+			const result = await performComplianceAnalysis(context);
+
+			expect(result.hasFindings).toBe(false);
+			expect(result.commentBody).toContain(CONTROLLOOM_SIGNATURE);
+			expect(result.commentBody).toContain('ControlLoom reviewed 1 files changed');
+		});
+	});
+
+	describe('cleanupOldPosts', () => {
+		it('should cleanup issue comments for comment mode', async () => {
+			await cleanupOldPosts(mockContext, 'comment');
+
+			expect(issuesListComments).toHaveBeenCalledWith({
+				owner: 'testowner',
+				repo: 'testrepo',
+				issue_number: 123,
+				per_page: 100,
+				page: 1
+			});
+		});
+
+		it('should cleanup reviews and review comments for review mode', async () => {
+			pullsListReviews.mockResolvedValue({ data: [] });
+			pullsListReviewComments.mockResolvedValue({ data: [] });
+
+			await cleanupOldPosts(mockContext, 'review');
+
+			expect(pullsListReviews).toHaveBeenCalledWith({
+				owner: 'testowner',
+				repo: 'testrepo',
+				pull_number: 123,
+				per_page: 100,
+				page: 1
+			});
+
+			expect(pullsListReviewComments).toHaveBeenCalledWith({
+				owner: 'testowner',
+				repo: 'testrepo',
+				pull_number: 123,
+				per_page: 100,
+				page: 1
+			});
+		});
+	});
+});
