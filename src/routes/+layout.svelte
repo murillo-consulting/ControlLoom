@@ -269,18 +269,14 @@
 						<p class="text-gray-500 dark:text-gray-400">Switching control set...</p>
 					</div>
 				</div>
-			{:else if !$appState.isConnected || !$appState.controls || $appState.controls.length === 0 || !$appState.fieldSchema}
+			{:else if !$appState.isConnected || !$appState.controls}
 				<div class="flex-1 flex justify-center items-center">
 					<div class="text-center">
 						<div
 							class="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto mb-4"
 						></div>
 						<p class="text-gray-500 dark:text-gray-400">
-							{!$appState.isConnected
-								? 'Connecting...'
-								: !$appState.fieldSchema
-									? 'Loading schema...'
-									: 'Loading controls...'}
+							{!$appState.isConnected ? 'Connecting...' : 'Loading controls...'}
 						</p>
 					</div>
 				</div>

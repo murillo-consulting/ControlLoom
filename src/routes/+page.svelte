@@ -4,9 +4,8 @@
 <!-- Modified in 2026 by Adrien Murillo for ControlLoom. -->
 
 <script lang="ts">
-	import { ControlDetailsPanel, ControlsList } from '$components/controls';
-	import { selectedControl } from '$stores/compliance';
-	import { Document } from 'carbon-icons-svelte';
+	import { ControlsList } from '$components/controls';
+	import WorkspaceOverview from '$lib/components/WorkspaceOverview.svelte';
 </script>
 
 <!-- Left Pane: Controls List Card -->
@@ -20,21 +19,5 @@
 
 <!-- Right Pane: Control Details -->
 <div class="w-1/2 flex flex-col">
-	{#if $selectedControl}
-		<ControlDetailsPanel control={$selectedControl} />
-	{:else}
-		<div class=" h-full flex flex-col">
-			<div class="flex-1 flex items-center justify-center p-8">
-				<div class="text-center text-gray-500 dark:text-gray-400">
-					<Document class="mx-auto h-16 w-16 mb-4" />
-					<h3 class="text-xl font-semibold text-gray-900 dark:text-white mb-2">
-						No Control Selected
-					</h3>
-					<p class="text-gray-600 dark:text-gray-400">
-						Select a control from the list to view and edit its details
-					</p>
-				</div>
-			</div>
-		</div>
-	{/if}
+	<WorkspaceOverview />
 </div>

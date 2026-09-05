@@ -83,9 +83,10 @@ class WebSocketClient {
 		}
 
 		const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-		// In development, WebSocket is on port 3000, not the dev server port
+		// The documented Vite UI uses the API on 3000. Built UI installations
+		// must keep their selected port instead of connecting to another service.
 		const host =
-			browser && window.location.hostname === 'localhost' ? 'localhost:3000' : window.location.host;
+			window.location.port === '5173' ? `${window.location.hostname}:3000` : window.location.host;
 		const wsUrl = `${protocol}//${host}/ws`;
 
 		console.log('Connecting to WebSocket:', wsUrl);
@@ -176,6 +177,7 @@ class WebSocketClient {
 		if (payload) {
 			appState.set({
 				...payload,
+				fieldSchema: payload.fieldSchema ?? payload.field_schema ?? { fields: {} },
 				isConnected: true,
 				isSwitchingControlSet: false // Clear switching flag after state update
 			});
@@ -189,6 +191,9 @@ class WebSocketClient {
 			appState.update((state) => ({
 				...state,
 				...payload,
+				fieldSchema: payload.fieldSchema ??
+					payload.field_schema ??
+					state.fieldSchema ?? { fields: {} },
 				isConnected: true,
 				isSwitchingControlSet: false // Clear switching flag
 			}));

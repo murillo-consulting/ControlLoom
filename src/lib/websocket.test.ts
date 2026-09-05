@@ -71,6 +71,7 @@ describe('WebSocket Client', () => {
 			value: {
 				protocol: 'http:',
 				hostname: 'localhost',
+				port: '5173',
 				host: 'localhost:5173'
 			},
 			writable: true
@@ -83,6 +84,15 @@ describe('WebSocket Client', () => {
 	});
 
 	describe('Connection Management', () => {
+		it('keeps a custom localhost API port for the built interface', () => {
+			Object.defineProperty(window, 'location', {
+				value: { protocol: 'http:', hostname: 'localhost', port: '3317', host: 'localhost:3317' },
+				writable: true
+			});
+			wsClient.connect();
+			expect(mockInstance?.url).toBe('ws://localhost:3317/ws');
+		});
+
 		it('should connect to WebSocket with correct URL', () => {
 			wsClient.connect();
 
@@ -291,6 +301,17 @@ describe('WebSocket Client', () => {
 		});
 
 		describe('handleMetadataUpdate', () => {
+			it('normalizes snake_case schemas for detail components', () => {
+				const schema = { fields: { id: { type: 'string' } } };
+				wsClient.handleStateUpdate({ field_schema: schema });
+				let currentState: AppState;
+				appState.subscribe((state) => (currentState = state))();
+				expect(currentState!.fieldSchema).toEqual(schema);
+				const updated = { fields: { title: { type: 'string' } } };
+				wsClient.handleMetadataUpdate({ field_schema: updated });
+				appState.subscribe((state) => (currentState = state))();
+				expect(currentState!.fieldSchema).toEqual(updated);
+			});
 			it('should update metadata and clear switching flag', () => {
 				appState.update((state) => ({ ...state, isSwitchingControlSet: true }));
 
