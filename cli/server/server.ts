@@ -4,6 +4,7 @@
 // Modified in 2026 by Adrien Murillo for ControlLoom.
 
 import cors from 'cors';
+import { localAccess } from './localAccess';
 import express from 'express';
 import ratelimit from 'express-rate-limit';
 import { existsSync, mkdirSync } from 'fs';
@@ -47,7 +48,8 @@ export async function createServer(options: ServerOptions): Promise<{
 	const app = express();
 
 	// Middleware
-	app.use(cors());
+	app.use((req, res, next) => localAccess(port || req.socket.localPort || 0)(req, res, next));
+	app.use(cors({ origin: true }));
 	app.use(express.json({ limit: '50mb' }));
 	app.use(limiter);
 
@@ -80,8 +82,10 @@ export async function createServer(options: ServerOptions): Promise<{
 		app,
 		start: () => {
 			return new Promise<void>((resolve) => {
-				httpServer.listen(port, () => {
-					console.log(`\n✨ ControlLoom is running at http://localhost:${port}`);
+				httpServer.listen(port, 'localhost', () => {
+					const address = port === 0 ? httpServer.address() : null;
+					const actualPort = address && typeof address !== 'string' ? address.port : port;
+					console.log(`\n✨ ControlLoom is running at http://localhost:${actualPort}`);
 					resolve();
 				});
 			});

@@ -15,6 +15,7 @@ import crypto from 'node:crypto';
 import { join } from 'path';
 import { WebSocket, WebSocketServer } from 'ws';
 import { debug } from '../utils/debug';
+import { isLocalRequest } from './localAccess';
 import { getControlId } from './infrastructure/controlHelpers';
 import { GitHistoryUtil } from './infrastructure/gitHistory';
 import { getCurrentControlSetPath, getServerState } from './serverState';
@@ -782,7 +783,19 @@ class WebSocketManager {
 	 * @param server - The HTTP server to attach to
 	 */
 	initialize(server: Server): void {
-		this.wss = new WebSocketServer({ server, path: '/ws' });
+		this.wss = new WebSocketServer({
+			server,
+			path: '/ws',
+			maxPayload: 1024 * 1024,
+			verifyClient: ({ req }: { req: import('node:http').IncomingMessage }) => {
+				const address = server.address();
+				return (
+					address !== null &&
+					typeof address !== 'string' &&
+					isLocalRequest(req.headers, address.port)
+				);
+			}
+		});
 
 		this.wss.on('connection', (ws: WebSocket) => {
 			debug('New WebSocket client connected');

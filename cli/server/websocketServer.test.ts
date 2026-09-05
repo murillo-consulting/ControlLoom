@@ -198,7 +198,9 @@ describe('websocketServer', () => {
 				wsManager.initialize(mockServer);
 				expect(mockWebSocketServer).toHaveBeenCalledWith({
 					server: mockServer,
-					path: '/ws'
+					path: '/ws',
+					maxPayload: 1024 * 1024,
+					verifyClient: expect.any(Function)
 				});
 			});
 

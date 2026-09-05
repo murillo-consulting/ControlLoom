@@ -25,7 +25,7 @@ type ExpressFactory = (() => ExpressAppMock) & {
 	static: (dir: string) => unknown;
 };
 
-type ListenFn = (port: number, cb: () => void) => void;
+type ListenFn = (port: number, host: string, cb: () => void) => void;
 
 type StdinRW = {
 	isTTY?: boolean;
@@ -142,7 +142,7 @@ describe('server', () => {
 		h.existsSync.mockReturnValue(true); // By default, directories exist
 		h.mkdirSync.mockImplementation(() => undefined); // Mock mkdir to do nothing
 
-		h.httpListen.mockImplementation((_port: number, cb: () => void) => cb());
+		h.httpListen.mockImplementation((_port: number, _host: string, cb: () => void) => cb());
 		h.loadAllData.mockResolvedValue(undefined);
 		logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined as unknown as void);
 		vi.spyOn(process, 'on').mockImplementation(((
@@ -201,7 +201,7 @@ describe('server', () => {
 			throw new Error('exit');
 		});
 
-		h.httpListen.mockImplementation((_p: number, cb: () => void) => cb());
+		h.httpListen.mockImplementation((_p: number, _host: string, cb: () => void) => cb());
 		await startServer({ controlSetDir: '/ctrl', port: 3040 });
 		const escErr = new Error('boom-esc');
 		h.saveMappingsToFile.mockRejectedValueOnce(escErr);
@@ -225,7 +225,7 @@ describe('server', () => {
 			throw new Error('exit');
 		});
 
-		h.httpListen.mockImplementation((_p: number, cb: () => void) => cb());
+		h.httpListen.mockImplementation((_p: number, _host: string, cb: () => void) => cb());
 		await startServer({ controlSetDir: '/ctrl', port: 3041 });
 
 		const sigErr = new Error('boom-sigint');
@@ -248,7 +248,7 @@ describe('server', () => {
 		const exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => {
 			throw new Error('exit');
 		});
-		h.httpListen.mockImplementation((_p: number, cb: () => void) => cb());
+		h.httpListen.mockImplementation((_p: number, _host: string, cb: () => void) => cb());
 
 		await startServer({ controlSetDir: '/ctrl', port: 3050 });
 
@@ -304,7 +304,7 @@ describe('server', () => {
 		);
 
 		await srv.start();
-		expect(h.httpListen).toHaveBeenCalledWith(4321, expect.any(Function));
+		expect(h.httpListen).toHaveBeenCalledWith(4321, 'localhost', expect.any(Function));
 		expect(logSpy).toHaveBeenCalledWith(expect.stringMatching(/http:\/\/localhost:4321/));
 	});
 
@@ -323,7 +323,7 @@ describe('server', () => {
 		});
 
 		h.saveMappingsToFile.mockResolvedValue(undefined);
-		h.httpListen.mockImplementation((_port: number, cb: () => void) => cb());
+		h.httpListen.mockImplementation((_port: number, _host: string, cb: () => void) => cb());
 
 		await startServer({ controlSetDir: '/ctrl', port: 3000 });
 

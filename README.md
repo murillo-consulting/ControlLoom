@@ -31,6 +31,11 @@ The interface opens on `http://localhost:5173`; the local API listens on `http:/
 
 ## What it does
 
+The home screen now highlights controls without mappings, reviews to complete
+and mappings marked verified, with direct links to the next controls to inspect.
+See the [workspace review and adoption guide](docs/product-review.md) for indicator
+definitions, local access restrictions, market references and the roadmap.
+
 ControlLoom focuses on five practical compliance workflows:
 
 - Import spreadsheet-based control catalogs without requiring OSCAL expertise.
