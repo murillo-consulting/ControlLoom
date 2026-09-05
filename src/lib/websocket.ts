@@ -177,6 +177,7 @@ class WebSocketClient {
 		if (payload) {
 			appState.set({
 				...payload,
+				fieldSchema: payload.fieldSchema ?? payload.field_schema ?? { fields: {} },
 				isConnected: true,
 				isSwitchingControlSet: false // Clear switching flag after state update
 			});
@@ -190,6 +191,9 @@ class WebSocketClient {
 			appState.update((state) => ({
 				...state,
 				...payload,
+				fieldSchema: payload.fieldSchema ??
+					payload.field_schema ??
+					state.fieldSchema ?? { fields: {} },
 				isConnected: true,
 				isSwitchingControlSet: false // Clear switching flag
 			}));

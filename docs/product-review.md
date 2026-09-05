@@ -29,12 +29,21 @@ Mappings referencing missing controls are reported separately. Duplicate
 control identifiers cannot inflate summary totals. Empty and disconnected
 workspaces show their actual state instead of a fabricated score.
 
+## Dependency security
+
+The lockfile includes patched `fast-uri`, `qs` and `nanoid` versions for the
+open dependency advisories identified in this review. Version-range overrides
+cover vulnerable transitive resolutions. `pnpm audit` reports no known
+vulnerabilities for this lockfile at review time; this is a dated registry check.
+
 ## Startup and navigation reliability
 
 The distributed CLI keeps npm packages external to its ESM bundle, allowing
 Node to load CommonJS dependencies correctly. CI starts the built executable
 in a temporary workspace, requests its UI and proves an untrusted write is
-rejected. The built UI keeps the selected server port for WebSockets. The workspace no longer waits indefinitely for a camelCase schema when snake_case metadata is supplied.
+rejected. The built UI keeps the selected server port for WebSockets. The workspace no longer waits indefinitely for a camelCase schema when snake_case metadata is supplied. Incoming schemas are
+normalized before detail components read them. The browser smoke test follows
+an overview link and reloads the control page to prevent regression.
 
 ## Local access model
 
@@ -64,7 +73,8 @@ pnpm run check
 pnpm run lint
 pnpm test
 pnpm run build
-node --test tests/built-cli.test.mjs
+pnpm exec playwright install chromium
+CONTROLLOOM_BROWSER_TEST=1 node --test tests/built-cli.test.mjs
 ```
 
 Access tests exercise a real local HTTP server and WebSocket upgrade, including

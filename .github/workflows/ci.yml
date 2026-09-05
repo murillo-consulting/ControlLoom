@@ -30,4 +30,7 @@ jobs:
       - run: pnpm run check
       - run: pnpm run test
       - run: pnpm run build
+      - run: pnpm exec playwright install --with-deps chromium
       - run: node --test tests/built-cli.test.mjs
+        env:
+          CONTROLLOOM_BROWSER_TEST: '1'

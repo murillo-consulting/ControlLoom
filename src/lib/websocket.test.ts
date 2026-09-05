@@ -301,6 +301,17 @@ describe('WebSocket Client', () => {
 		});
 
 		describe('handleMetadataUpdate', () => {
+			it('normalizes snake_case schemas for detail components', () => {
+				const schema = { fields: { id: { type: 'string' } } };
+				wsClient.handleStateUpdate({ field_schema: schema });
+				let currentState: AppState;
+				appState.subscribe((state) => (currentState = state))();
+				expect(currentState!.fieldSchema).toEqual(schema);
+				const updated = { fields: { title: { type: 'string' } } };
+				wsClient.handleMetadataUpdate({ field_schema: updated });
+				appState.subscribe((state) => (currentState = state))();
+				expect(currentState!.fieldSchema).toEqual(updated);
+			});
 			it('should update metadata and clear switching flag', () => {
 				appState.update((state) => ({ ...state, isSwitchingControlSet: true }));
 
