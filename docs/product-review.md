@@ -41,7 +41,9 @@ vulnerabilities for this lockfile at review time; this is a dated registry check
 The distributed CLI keeps npm packages external to its ESM bundle, allowing
 Node to load CommonJS dependencies correctly. CI starts the built executable
 in a temporary workspace, requests its UI and proves an untrusted write is
-rejected. The built UI keeps the selected server port for WebSockets. The workspace no longer waits indefinitely for a camelCase schema when snake_case metadata is supplied. Incoming schemas are
+rejected. The built UI keeps the selected server port for WebSockets. The
+workspace no longer waits indefinitely for a camelCase schema when snake_case
+metadata is supplied. Incoming schemas are
 normalized before detail components read them. The browser smoke test follows
 an overview link and reloads the control page to prevent regression.
 
@@ -100,6 +102,7 @@ around an origin error.
 
 ## Rollback
 
-No YAML format or dependency changes are required. Revert the change commit to
-restore the prior screen and access behavior. That also removes the local
+No YAML data migration is required. Revert the change commits and reinstall
+from the restored lockfile to restore prior dependencies, screen and access
+behavior. That also removes the local
 access protection, so keep any reverted service stopped when it is not needed.
