@@ -1,0 +1,173 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "ControlLoom — architecture",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1090,
+      540
+    ],
+    "repository": {
+      "url": "https://github.com/murillo-consulting/ControlLoom",
+      "revision": "30949388cc71b8b963d2b35f89d9d2f082634153",
+      "provider": "github"
+    }
+  },
+  "components": [
+    {
+      "id": "component-0",
+      "type": "frontend",
+      "label": "Interface SvelteKit",
+      "sublabel": "Espace de conformité",
+      "pos": [
+        50,
+        65
+      ],
+      "size": [
+        235,
+        90
+      ],
+      "sources": [
+        {
+          "path": "src/routes/+page.svelte",
+          "line": 6,
+          "end_line": 14
+        }
+      ]
+    },
+    {
+      "id": "component-1",
+      "type": "backend",
+      "label": "API Express",
+      "sublabel": "Routes locales /api",
+      "pos": [
+        425,
+        65
+      ],
+      "size": [
+        235,
+        90
+      ],
+      "sources": [
+        {
+          "path": "cli/server/server.ts",
+          "line": 50,
+          "end_line": 58
+        }
+      ]
+    },
+    {
+      "id": "component-2",
+      "type": "database",
+      "label": "Stockage YAML",
+      "sublabel": "Contrôles et mappings",
+      "pos": [
+        800,
+        65
+      ],
+      "size": [
+        235,
+        90
+      ],
+      "sources": [
+        {
+          "path": "cli/server/infrastructure/fileStore.ts",
+          "line": 46,
+          "end_line": 54
+        }
+      ]
+    },
+    {
+      "id": "component-3",
+      "type": "database",
+      "label": "Historique Git",
+      "sublabel": "Diffs et chronologie",
+      "pos": [
+        800,
+        365
+      ],
+      "size": [
+        235,
+        90
+      ],
+      "sources": [
+        {
+          "path": "cli/server/infrastructure/gitHistory.ts",
+          "line": 7,
+          "end_line": 15
+        }
+      ]
+    },
+    {
+      "id": "component-4",
+      "type": "backend",
+      "label": "Import tableur",
+      "sublabel": "CSV et XLSX",
+      "pos": [
+        425,
+        365
+      ],
+      "size": [
+        235,
+        90
+      ],
+      "sources": [
+        {
+          "path": "cli/server/spreadsheetRoutes.ts",
+          "line": 8,
+          "end_line": 16
+        }
+      ]
+    },
+    {
+      "id": "component-5",
+      "type": "messagebus",
+      "label": "WebSocket",
+      "sublabel": "Mises à jour interface",
+      "pos": [
+        50,
+        365
+      ],
+      "size": [
+        235,
+        90
+      ],
+      "sources": [
+        {
+          "path": "src/lib/websocket.ts",
+          "line": 66,
+          "end_line": 74
+        }
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "edge-0-1",
+      "from": "component-0",
+      "to": "component-1",
+      "label": "HTTP"
+    },
+    {
+      "id": "edge-1-2",
+      "from": "component-1",
+      "to": "component-2",
+      "label": "persiste"
+    },
+    {
+      "id": "edge-1-4",
+      "from": "component-1",
+      "to": "component-4",
+      "label": "importe",
+      "labelDy": 60
+    },
+    {
+      "id": "edge-0-5",
+      "from": "component-0",
+      "to": "component-5",
+      "label": "écoute",
+      "labelDy": 60
+    }
+  ]
+}

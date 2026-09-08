@@ -106,3 +106,7 @@ ControlLoom is maintained by [Adrien Murillo](https://github.com/murillo-consult
 ## License
 
 ControlLoom is distributed under the [Apache License 2.0](LICENSE). Original and third-party components remain under their respective terms.
+
+## Architecture interactive
+
+[Carte Archify et sources vérifiées](docs/architecture/README.md).
